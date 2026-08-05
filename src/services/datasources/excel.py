@@ -88,6 +88,26 @@ class ExcelConnector(DatasourceConnector):
                 })
         return summaries
 
+    def get_schema(self):
+        """Build a DbSchema where each worksheet is a table (no PK/FK in Excel)."""
+        from src.core.constants import DatasourceType
+        from src.domain.models import DbColumn, DbSchema, DbTable
+
+        pd = self._require_pandas()
+        path = self._resolve_path()
+        schema = DbSchema(datasource_type=DatasourceType.EXCEL, database=path.name)
+        with pd.ExcelFile(path) as xls:
+            for name in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=name)
+                cols = [
+                    DbColumn(name=str(c), data_type=str(df[c].dtype)) for c in df.columns
+                ]
+                schema.tables.append(DbTable(
+                    schema="", name=str(name), kind="sheet",
+                    columns=cols, row_count=int(len(df)),
+                ))
+        return schema
+
     def get_columns(self, dataset: str) -> list[str]:
         pd = self._require_pandas()
         path = self._resolve_path()

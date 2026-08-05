@@ -225,6 +225,53 @@ def _visual_step(ctx: AppContext, project) -> None:
     else:
         st.caption("No visual analysis yet. Click **Process screenshots** to begin.")
 
+    _vision_extraction(ctx, project)
+
+
+def _vision_extraction(ctx: AppContext, project) -> None:
+    """AI Vision: read KPIs/charts/filters/values from the screenshots."""
+    st.markdown("##### AI vision extraction")
+    st.caption(
+        "The AI reads KPI values, charts and filters directly from the screenshot(s). "
+        "Requires a **vision-capable** model (e.g. Groq `meta-llama/llama-4-scout-17b-16e-instruct`, "
+        "OpenAI `gpt-4o`, Gemini `gemini-2.0-flash`)."
+    )
+    settings = ctx.llm_service.load_settings(project)
+    if not settings.is_configured:
+        st.info("Configure an LLM provider and API key in Step 4 to enable vision extraction.")
+        return
+
+    existing = ctx.vision_service.load(project)
+    label = "🔁 Re-run vision extraction" if existing else "👁️ Extract with AI vision"
+    if st.button(label, type="primary", key="btn_vision"):
+        with st.spinner(f"Analysing screenshot(s) with {settings.provider}…"):
+            try:
+                existing = ctx.vision_service.extract(project, settings)
+                st.success(
+                    f"Vision extraction complete: {len(existing.kpis)} KPI(s), "
+                    f"{len(existing.visuals)} visual(s)."
+                )
+            except BITestPilotError as exc:
+                st.error(str(exc))
+            except Exception as exc:  # noqa: BLE001 - surface API/model errors
+                st.error(f"Vision extraction failed: {exc}")
+
+    if not existing:
+        return
+    if existing.kpis:
+        st.markdown("**Detected KPIs**")
+        st.dataframe(pd.DataFrame([{
+            "KPI": k.name, "Dashboard value": k.raw_value,
+            "Parsed number": k.numeric_value, "Unit": k.unit,
+        } for k in existing.kpis]), use_container_width=True, hide_index=True)
+    if existing.visuals:
+        st.markdown("**Detected visuals**")
+        st.dataframe(pd.DataFrame([{
+            "Type": v.visual_type, "Title": v.title, "Fields": ", ".join(v.fields),
+        } for v in existing.visuals]), use_container_width=True, hide_index=True)
+    if existing.filters:
+        st.markdown("**Filters:** " + ", ".join(existing.filters))
+
 
 def _render_context(context: AnalysisContext) -> None:
     summary = context.validation_summary()
@@ -428,6 +475,114 @@ def _ai_step(ctx: AppContext, project) -> None:
         _render_reasoning(existing)
 
 
+def _validation_plan_step(ctx: AppContext, project) -> None:
+    """Step 5 — AI maps each KPI to SQL (no execution)."""
+    theme.section("Step 5 — Validation Plan (KPI → SQL)")
+    st.caption(
+        "The AI maps each dashboard KPI to a datasource table/column/aggregation and "
+        "**generates the SQL** to compute it. Python validates the SQL is read-only and "
+        "stores it. Nothing is executed here — execution happens in Data Validation."
+    )
+    settings = ctx.llm_service.load_settings(project)
+    schema = ctx.schema_service.load_schema(project)
+    extraction = ctx.vision_service.load(project)
+    metadata = ctx.metadata_service.load(project)
+
+    prereqs = []
+    if not settings.is_configured:
+        prereqs.append("configure an LLM (Step 4)")
+    if not schema or not schema.tables:
+        prereqs.append("read the database schema (Datasource page)")
+    if not (extraction and extraction.kpis) and not (metadata and metadata.all_measures):
+        prereqs.append("run AI vision extraction (Step 2) or extract metadata (Step 1)")
+    if prereqs:
+        st.info("To generate a validation plan: " + "; ".join(prereqs) + ".")
+        return
+
+    existing = ctx.validation_plan_service.load(project)
+    label = "🔁 Regenerate validation plan" if existing else "🧭 Generate validation plan"
+    if st.button(label, type="primary", key="btn_plan"):
+        with st.spinner(f"Mapping KPIs to SQL via {settings.provider}…"):
+            try:
+                existing = ctx.validation_plan_service.generate(project, settings)
+                st.success(f"Validation plan generated: {len(existing.items)} item(s).")
+            except BITestPilotError as exc:
+                st.error(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Plan generation failed: {exc}")
+
+    if existing and existing.items:
+        st.dataframe(pd.DataFrame([{
+            "KPI": it.kpi_name, "Dashboard value": it.dashboard_value,
+            "Table": it.table, "Column": it.column, "Aggregation": it.aggregation,
+            "Confidence": it.confidence, "Generated SQL": it.generated_sql,
+        } for it in existing.items]), use_container_width=True, hide_index=True)
+        st.caption("This SQL will be executed by Python in the Data Validation step (V5).")
+
+
+def _data_validation_step(ctx: AppContext, project) -> None:
+    """Step 6 — Python executes the plan's SQL and compares to dashboard values."""
+    theme.section("Step 6 — Data Validation (SQL execution & comparison)")
+    st.caption(
+        "Python executes each generated SQL query (read-only), captures the result "
+        "and timing, and compares it to the dashboard value within a tolerance → "
+        "PASS/FAIL. The AI never executes SQL."
+    )
+    plan = ctx.validation_plan_service.load(project)
+    if not plan or not plan.items:
+        st.info("Generate a validation plan in Step 5 first.")
+        return
+
+    tolerance = st.number_input(
+        "Tolerance (%)", min_value=0.0, max_value=50.0, value=1.0, step=0.5,
+        help="A KPI passes when the dashboard vs database difference is within this %.",
+    )
+    if st.button("▶️ Run SQL validation", type="primary", key="btn_sql_val"):
+        with st.spinner("Executing SQL and comparing values…"):
+            try:
+                ctx.sql_validation_engine.run(project, tolerance_pct=float(tolerance))
+                st.success("Data validation complete.")
+            except BITestPilotError as exc:
+                st.error(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Data validation failed: {exc}")
+
+    run = ctx.sql_validation_engine.load(project)
+    if not run or not run.results:
+        st.caption("No data validation run yet.")
+        return
+
+    s = run.summary()
+    c = st.columns(4)
+    c[0].metric("Tests", s["total"])
+    c[1].metric("Pass", s["passed"])
+    c[2].metric("Fail", s["failed"])
+    c[3].metric("Errors", s["errors"])
+
+    st.dataframe(pd.DataFrame([{
+        "Test ID": r.test_id, "KPI": r.kpi_name, "Dashboard Value": r.dashboard_value,
+        "Generated SQL": r.generated_sql, "Database Value": r.database_value,
+        "Difference": r.difference, "Execution Time (ms)": r.execution_time_ms,
+        "Status": str(r.status),
+    } for r in run.results]), use_container_width=True, hide_index=True)
+
+    settings = ctx.llm_service.load_settings(project)
+    has_failures = any(r.status.value == "Fail" for r in run.results)
+    if has_failures and settings.is_configured:
+        if st.button("🧠 Explain failures with AI", key="btn_explain_fail"):
+            with st.spinner("Asking the AI to explain failures…"):
+                try:
+                    run = ctx.sql_validation_engine.explain_failures(project, settings)
+                    st.success("Explanations added.")
+                except BITestPilotError as exc:
+                    st.error(str(exc))
+        recs = [r for r in run.results if r.recommendation]
+        if recs:
+            st.markdown("**AI recommendations**")
+            for r in recs:
+                st.markdown(f"- **{r.test_id} · {r.kpi_name}** — {r.recommendation}")
+
+
 def _run_full_analysis(ctx: AppContext, project) -> None:
     """One-click orchestration of the whole pipeline.
 
@@ -530,3 +685,5 @@ def render(ctx: AppContext) -> None:
     _visual_step(ctx, project)
     _context_step(ctx, project)
     _ai_step(ctx, project)
+    _validation_plan_step(ctx, project)
+    _data_validation_step(ctx, project)

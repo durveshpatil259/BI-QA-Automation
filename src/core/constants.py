@@ -156,6 +156,10 @@ METADATA_FILE = "dashboard_metadata.json"     # Metadata/dashboard_metadata.json
 VISUAL_ANALYSIS_FILE = "visual_analysis.json"  # Metadata/visual_analysis.json
 AI_REASONING_FILE = "ai_reasoning.json"       # Reports/ai_reasoning.json
 TEST_CASES_FILE = "test_cases.json"           # Generated Test Cases/test_cases.json
+DASHBOARD_EXTRACTION_FILE = "dashboard_extraction.json"  # Metadata/
+VALIDATION_PLAN_FILE = "validation_plan.json"  # Metadata/validation_plan.json
+DATA_VALIDATION_FILE = "data_validation.json"  # Reports/data_validation.json
+DB_SCHEMA_FILE = "db_schema.json"             # Configuration/db_schema.json
 
 # Recognised dashboard file extensions per platform (lower-case, no dot list).
 DASHBOARD_EXTENSIONS: dict[BIPlatform, tuple[str, ...]] = {

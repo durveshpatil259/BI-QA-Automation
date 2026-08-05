@@ -25,6 +25,7 @@ from src.core.constants import APP_NAME  # noqa: E402
 from src.ui import theme  # noqa: E402
 from src.ui.pages import (  # noqa: E402
     analysis,
+    data_validation,
     datasource,
     history,
     home,
@@ -45,6 +46,7 @@ NAV = {
     "Upload": ("⬆️", upload.render),
     "Datasource": ("🔌", datasource.render),
     "Analysis": ("⚙️", analysis.render),
+    "Data Validation": ("🧮", data_validation.render),
     "Reports": ("📊", reports.render),
     "Test Cases": ("✅", test_cases.render),
     "Settings": ("🛠️", settings.render),

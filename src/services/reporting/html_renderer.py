@@ -97,6 +97,28 @@ _TEMPLATE = """<!doctype html>
   </table>
   {% else %}<p class="muted">No findings.</p>{% endif %}
 
+  {% if report.sql_validations %}
+  <h2>Data validation (dashboard vs database)</h2>
+  <div class="cards">
+    <div class="card"><div class="n">{{ dvs.get('total', 0) }}</div><div class="l">Tests</div></div>
+    <div class="card"><div class="n">{{ dvs.get('passed', 0) }}</div><div class="l">Pass</div></div>
+    <div class="card"><div class="n">{{ dvs.get('failed', 0) }}</div><div class="l">Fail</div></div>
+    <div class="card"><div class="n">{{ dvs.get('errors', 0) }}</div><div class="l">Errors</div></div>
+  </div>
+  <table>
+    <tr><th>Test ID</th><th>KPI</th><th>Dashboard</th><th>Generated SQL</th>
+        <th>Database</th><th>Difference</th><th>Time (ms)</th><th>Status</th></tr>
+    {% for r in report.sql_validations %}
+    <tr>
+      <td>{{ r.test_id }}</td><td>{{ r.kpi_name }}</td><td>{{ r.dashboard_value }}</td>
+      <td class="pre">{{ r.generated_sql }}</td><td>{{ r.database_value }}</td>
+      <td>{{ r.difference }}</td><td>{{ r.execution_time_ms }}</td>
+      <td><span class="pill {{ dv_status_class(r) }}">{{ r.status }}</span></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
   {% if report.comparisons %}
   <h2>Datasource comparison</h2>
   <table>
@@ -166,9 +188,11 @@ def render_html(report: AnalysisReport) -> str:
     return template.render(
         report=report,
         vs=report.validation_summary or {"total": 0, "passed": 0, "failed": 0, "critical": 0},
+        dvs=report.data_validation_summary or {},
         findings=findings,
         sev_class=_sev_class,
         status_class=_status_class,
+        dv_status_class=_status_class,
         app_name=APP_NAME,
         app_tagline=APP_TAGLINE,
     )

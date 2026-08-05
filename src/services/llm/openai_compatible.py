@@ -134,3 +134,60 @@ class OpenAICompatibleClient(LLMClient):
         payload = self._build_payload(messages)
         _logger.info("Calling %s model=%s", self.settings.provider, self.model)
         return self._parse_response(self._post(payload))
+
+    # --- vision (multimodal chat completions) -----------------------------
+    @staticmethod
+    def _detect_image_format(data: bytes) -> str:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if data[:3] == b"\xff\xd8\xff":
+            return "jpeg"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if data[:2] == b"BM":
+            return "bmp"
+        return "png"
+
+    def vision_complete(
+        self,
+        system: str,
+        user: str,
+        images: list[bytes],
+        *,
+        image_formats: list[str] | None = None,
+    ) -> LLMResponse:
+        import base64
+
+        if not self.settings.api_key.strip():
+            raise LLMConfigError(
+                f"No API key configured for {self.settings.provider}."
+            )
+        if not self.base_url:
+            raise LLMConfigError(f"No base URL configured for {self.settings.provider}.")
+
+        content: list[dict] = [{"type": "text", "text": user}]
+        for i, img in enumerate(images):
+            fmt = (
+                image_formats[i] if image_formats and i < len(image_formats)
+                else self._detect_image_format(img)
+            )
+            b64 = base64.b64encode(img).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/{fmt};base64,{b64}"},
+            })
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        _logger.info(
+            "Calling %s vision model=%s with %d image(s)",
+            self.settings.provider, self.model, len(images),
+        )
+        return self._parse_response(self._post(payload))

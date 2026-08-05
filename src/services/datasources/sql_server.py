@@ -8,22 +8,15 @@ never be used to mutate the source.
 
 from __future__ import annotations
 
-import re
 import urllib.parse
 
 from src.core.exceptions import DatasourceConfigError, DatasourceConnectionError
 from src.core.logger import get_logger
 from src.domain.models import DatasourceConfig, DataQueryResult
 from src.services.datasources.base import ConnectionTestResult, DatasourceConnector
+from src.services.validation.sql_guard import is_read_only
 
 _logger = get_logger()
-
-# Only allow read statements. Reject batches (semicolons) and write/DDL verbs.
-_READ_ONLY = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
-_FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|drop|alter|create|truncate|merge|exec|execute|grant|revoke)\b",
-    re.IGNORECASE,
-)
 
 
 class SqlServerConnector(DatasourceConnector):
@@ -165,6 +158,90 @@ class SqlServerConnector(DatasourceConnector):
         with self._get_engine().connect() as conn:
             return [row[0] for row in conn.execute(sql).fetchall()]
 
+    # --- schema introspection --------------------------------------------
+    def get_schema(self):
+        """Read tables, columns, primary keys and foreign keys via catalog views."""
+        from sqlalchemy import text
+
+        engine = self._get_engine()
+        with engine.connect() as conn:
+            db = conn.execute(text("SELECT DB_NAME()")).scalar()
+            tables = conn.execute(text(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE IN ('BASE TABLE','VIEW')"
+            )).fetchall()
+            columns = conn.execute(text(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, "
+                "ORDINAL_POSITION FROM INFORMATION_SCHEMA.COLUMNS "
+                "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+            )).fetchall()
+            pks = conn.execute(text(
+                "SELECT tc.TABLE_SCHEMA, tc.TABLE_NAME, kcu.COLUMN_NAME "
+                "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc "
+                "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu "
+                "  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME "
+                "  AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA "
+                "WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'"
+            )).fetchall()
+            fks = conn.execute(text(
+                "SELECT fk.name, sch.name, tp.name, cp.name, rsch.name, tr.name, cr.name "
+                "FROM sys.foreign_keys fk "
+                "JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id "
+                "JOIN sys.tables tp ON tp.object_id = fk.parent_object_id "
+                "JOIN sys.schemas sch ON sch.schema_id = tp.schema_id "
+                "JOIN sys.columns cp ON cp.object_id = tp.object_id AND cp.column_id = fkc.parent_column_id "
+                "JOIN sys.tables tr ON tr.object_id = fk.referenced_object_id "
+                "JOIN sys.schemas rsch ON rsch.schema_id = tr.schema_id "
+                "JOIN sys.columns cr ON cr.object_id = tr.object_id AND cr.column_id = fkc.referenced_column_id"
+            )).fetchall()
+        return self._assemble_schema(str(db), tables, columns, pks, fks)
+
+    @staticmethod
+    def _assemble_schema(database, table_rows, column_rows, pk_rows, fk_rows):
+        """Pure assembly of catalog rows into a DbSchema (unit-testable)."""
+        from src.core.constants import DatasourceType
+        from src.domain.models import DbColumn, DbForeignKey, DbSchema, DbTable
+
+        def key(schema, name):
+            return f"{schema}.{name}"
+
+        kinds = {
+            key(s, n): ("view" if str(t).upper() == "VIEW" else "table")
+            for s, n, t in table_rows
+        }
+        pk_set = {key(s, n): set() for s, n in {(r[0], r[1]) for r in pk_rows}}
+        for s, n, col in pk_rows:
+            pk_set.setdefault(key(s, n), set()).add(col)
+
+        tables: dict[str, DbTable] = {}
+        for s, n, col, dtype, nullable, _ordinal in column_rows:
+            k = key(s, n)
+            if k not in kinds:
+                continue  # skip columns of non-base tables/views
+            tbl = tables.get(k)
+            if tbl is None:
+                tbl = DbTable(schema=s, name=n, kind=kinds.get(k, "table"),
+                              primary_keys=sorted(pk_set.get(k, set())))
+                tables[k] = tbl
+            is_pk = col in pk_set.get(k, set())
+            tbl.columns.append(DbColumn(
+                name=col, data_type=str(dtype),
+                nullable=str(nullable).upper() == "YES", is_primary_key=is_pk,
+            ))
+
+        for _name, s, n, col, rsch, rtbl, rcol in fk_rows:
+            tbl = tables.get(key(s, n))
+            if tbl is not None:
+                tbl.foreign_keys.append(DbForeignKey(
+                    column=col, ref_table=key(rsch, rtbl), ref_column=rcol,
+                    constraint_name=str(_name),
+                ))
+
+        return DbSchema(
+            datasource_type=DatasourceType.SQL_SERVER, database=database,
+            tables=sorted(tables.values(), key=lambda t: t.full_name.lower()),
+        )
+
     def preview_dataset(self, dataset: str, *, sample_rows: int = 50):
         """Build a safe ``SELECT TOP N *`` for the given ``schema.table``."""
         schema, table = self._split_dataset(dataset)
@@ -185,10 +262,7 @@ class SqlServerConnector(DatasourceConnector):
     # --- safety -----------------------------------------------------------
     @staticmethod
     def _assert_read_only(query: str) -> None:
-        q = (query or "").strip().rstrip(";")
-        if ";" in q:
-            raise DatasourceConfigError("Multiple statements are not allowed.")
-        if not _READ_ONLY.match(q) or _FORBIDDEN.search(q):
+        if not is_read_only(query):
             raise DatasourceConfigError(
                 "Only a single read-only SELECT/WITH statement is permitted."
             )

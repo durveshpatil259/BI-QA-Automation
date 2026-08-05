@@ -19,6 +19,8 @@ from src.ui.state import AppContext, get_active_project
 _COLUMNS = [
     "Test Case ID", "Kind", "Module", "Test Scenario", "Test Steps", "Test Data",
     "Expected Result", "Actual Result", "Status", "Priority", "Remarks",
+    "Dashboard Value", "Generated SQL", "Database Value", "Difference",
+    "Execution Time (ms)", "Confidence Score",
 ]
 
 
@@ -35,6 +37,12 @@ def _to_dataframe(cases: list[TestCase]) -> pd.DataFrame:
         "Status": str(c.status),
         "Priority": str(c.priority),
         "Remarks": c.remarks,
+        "Dashboard Value": c.dashboard_value,
+        "Generated SQL": c.generated_sql,
+        "Database Value": c.database_value,
+        "Difference": c.difference,
+        "Execution Time (ms)": c.execution_time_ms,
+        "Confidence Score": c.confidence_score,
     } for c in cases]
     return pd.DataFrame(rows, columns=_COLUMNS)
 
@@ -65,33 +73,36 @@ def render(ctx: AppContext) -> None:
     context = ctx.analysis_service.load_context(project)
     settings = ctx.llm_service.load_settings(project)
 
-    if context is None:
-        st.warning(
-            "No Analysis Context found. Go to **Analysis** and run Step 3 "
-            "(Comparison & Validation) first."
-        )
-        return
-
     st.caption(
-        "Test cases are authored by the LLM from the deterministic context, then "
-        "**Actual Result / Status / Remarks are auto-populated by Python** from the "
-        "validation findings — the verdict is evidence-based, not model opinion."
+        "**Full test suite (rule-based)** expands every KPI, chart, filter, page and "
+        "model object into Developer + QA tests and merges the executed SQL-validation "
+        "results (with Generated SQL + PASS/FAIL). **AI generation** adds targeted, "
+        "evidence-linked cases. Both write to the same grid."
     )
 
-    existing = ctx.test_case_service.load(project)
-    label = "🔁 Regenerate test cases" if existing else "🧪 Generate test cases"
-    disabled = not settings.is_configured
-    if st.button(label, type="primary", disabled=disabled):
-        with st.spinner(f"Generating test cases via {settings.provider}…"):
+    existing = ctx.test_expansion_service.load(project)
+
+    b1, b2 = st.columns(2)
+    if b1.button("🧩 Generate full test suite (rule-based)", type="primary"):
+        with st.spinner("Expanding KPIs, charts, filters and model into tests…"):
             try:
-                existing = ctx.test_case_service.generate(project, context, settings)
+                existing = ctx.test_expansion_service.expand(project)
                 st.success(f"Generated {len(existing)} test case(s).")
             except BITestPilotError as exc:
                 st.error(str(exc))
-    if disabled:
-        st.info(
-            "Configure an LLM provider and API key on the **Analysis** page (Step 4) "
-            "to enable generation."
+
+    ai_disabled = not settings.is_configured or context is None
+    if b2.button("🧪 AI-generate targeted cases", disabled=ai_disabled):
+        with st.spinner(f"Generating test cases via {settings.provider}…"):
+            try:
+                existing = ctx.test_case_service.generate(project, context, settings)
+                st.success(f"Generated {len(existing)} AI test case(s).")
+            except BITestPilotError as exc:
+                st.error(str(exc))
+    if ai_disabled:
+        st.caption(
+            "AI generation needs an LLM (Analysis Step 4) and an Analysis Context "
+            "(Analysis Step 3)."
         )
 
     if not existing:

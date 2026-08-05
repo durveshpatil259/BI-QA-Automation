@@ -344,6 +344,198 @@ class TestCase(SerializableMixin):
     priority: Priority = Priority.MEDIUM
     remarks: str = ""
 
+    # --- data-validation columns (populated for SQL validation tests) ------
+    generated_sql: str = ""
+    dashboard_value: str = ""
+    database_value: str = ""
+    difference: str = ""
+    execution_time_ms: float | None = None
+    confidence_score: float | None = None
+
+
+# ===========================================================================
+# 6. Datasource schema (redesign — read by Python, mapped by AI)
+# ===========================================================================
+@dataclass
+class DbColumn(SerializableMixin):
+    name: str = ""
+    data_type: str = ""
+    nullable: bool = True
+    is_primary_key: bool = False
+
+
+@dataclass
+class DbForeignKey(SerializableMixin):
+    column: str = ""
+    ref_table: str = ""              # schema-qualified referenced table
+    ref_column: str = ""
+    constraint_name: str = ""
+
+
+@dataclass
+class DbTable(SerializableMixin):
+    schema: str = ""                 # e.g. "dbo" (empty for Excel sheets)
+    name: str = ""
+    kind: str = "table"             # "table" | "view" | "sheet"
+    columns: list[DbColumn] = field(default_factory=list)
+    primary_keys: list[str] = field(default_factory=list)
+    foreign_keys: list[DbForeignKey] = field(default_factory=list)
+    row_count: int | None = None
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.schema}.{self.name}" if self.schema else self.name
+
+
+@dataclass
+class DbSchema(SerializableMixin):
+    """Deterministically-read datasource schema. Feeds the AI semantic mapping."""
+
+    datasource_type: DatasourceType | None = None
+    database: str = ""
+    tables: list[DbTable] = field(default_factory=list)
+    generated_at: _dt.datetime = field(default_factory=_now)
+    warnings: list[str] = field(default_factory=list)
+
+    def summary_counts(self) -> dict[str, int]:
+        return {
+            "tables": len(self.tables),
+            "columns": sum(len(t.columns) for t in self.tables),
+            "primary_keys": sum(len(t.primary_keys) for t in self.tables),
+            "foreign_keys": sum(len(t.foreign_keys) for t in self.tables),
+        }
+
+    def compact_text(self, max_tables: int = 60) -> str:
+        """A compact textual rendering for inclusion in an AI prompt."""
+        lines: list[str] = []
+        for t in self.tables[:max_tables]:
+            cols = ", ".join(
+                f"{c.name}:{c.data_type}" + ("(PK)" if c.is_primary_key else "")
+                for c in t.columns
+            )
+            lines.append(f"{t.full_name} [{t.kind}] — {cols}")
+            for fk in t.foreign_keys:
+                lines.append(
+                    f"    FK {t.full_name}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
+                )
+        if len(self.tables) > max_tables:
+            lines.append(f"… and {len(self.tables) - max_tables} more tables")
+        return "\n".join(lines)
+
+
+# ===========================================================================
+# 7. Dashboard understanding & data validation (redesign)
+# ===========================================================================
+@dataclass
+class DashboardKPI(SerializableMixin):
+    """A single KPI/metric read off the dashboard (screenshot or model)."""
+
+    name: str = ""
+    raw_value: str = ""              # as displayed, e.g. "109.81M", "11.4%"
+    numeric_value: float | None = None   # parsed by Python, e.g. 109810000.0
+    unit: str = ""                   # "", "%", "currency"
+    source: str = ""                 # "screenshot" | "metadata"
+
+
+@dataclass
+class DetectedVisual(SerializableMixin):
+    """A visual detected on the dashboard (screenshot or report layout)."""
+
+    visual_type: str = ""            # kpi_card, bar_chart, line_chart, table,
+                                     # matrix, slicer, gauge, donut, treemap, map…
+    title: str = ""
+    fields: list[str] = field(default_factory=list)
+    text: str = ""                   # visible labels / values
+    page: str = ""
+    source: str = ""                 # "screenshot" | "metadata"
+
+
+@dataclass
+class DashboardExtraction(SerializableMixin):
+    """Structured understanding of a dashboard, from AI vision and/or metadata."""
+
+    source: str = ""                 # "screenshot" | "pbix" | "combined"
+    kpis: list[DashboardKPI] = field(default_factory=list)
+    visuals: list[DetectedVisual] = field(default_factory=list)
+    filters: list[str] = field(default_factory=list)
+    visible_text: str = ""
+    generated_at: _dt.datetime = field(default_factory=_now)
+    provider: LLMProvider | None = None
+    model: str = ""
+    raw_response: str = ""
+
+
+@dataclass
+class ValidationPlanItem(SerializableMixin):
+    """AI-produced mapping of one KPI to its datasource query (no execution)."""
+
+    id: str = field(default_factory=lambda: _new_id("VP"))
+    kpi_name: str = ""
+    dashboard_value: str = ""
+    table: str = ""
+    column: str = ""
+    aggregation: str = ""            # SUM / AVG / COUNT / DISTINCTCOUNT…
+    business_meaning: str = ""
+    filters: list[str] = field(default_factory=list)
+    generated_sql: str = ""          # the SQL Python will execute
+    confidence: float = 0.0
+
+
+@dataclass
+class ValidationPlan(SerializableMixin):
+    """A full validation plan: one item per KPI, with generated SQL."""
+
+    items: list[ValidationPlanItem] = field(default_factory=list)
+    generated_at: _dt.datetime = field(default_factory=_now)
+    provider: LLMProvider | None = None
+    model: str = ""
+    raw_response: str = ""
+
+
+@dataclass
+class SqlValidationResult(SerializableMixin):
+    """Outcome of executing one plan item's SQL and comparing to the dashboard.
+
+    Produced entirely by Python (execution + comparison); the AI only supplies
+    the optional recommendation text when a failure is explained later.
+    """
+
+    test_id: str = field(default_factory=lambda: _new_id("QA"))
+    kpi_name: str = ""
+    dashboard_value: str = ""
+    dashboard_numeric: float | None = None
+    generated_sql: str = ""
+    database_value: str = ""
+    database_numeric: float | None = None
+    difference: str = ""
+    difference_pct: float | None = None
+    tolerance_pct: float = 1.0
+    execution_time_ms: float | None = None
+    execution_status: str = ""       # "ok" | "error"
+    status: TestStatus = TestStatus.NOT_EXECUTED
+    reason: str = ""
+    recommendation: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class DataValidationRun(SerializableMixin):
+    """Persisted collection of SQL validation results for a project."""
+
+    results: list[SqlValidationResult] = field(default_factory=list)
+    generated_at: _dt.datetime = field(default_factory=_now)
+
+    def summary(self) -> dict[str, int]:
+        passed = sum(1 for r in self.results if r.status == TestStatus.PASS)
+        failed = sum(1 for r in self.results if r.status == TestStatus.FAIL)
+        errored = sum(1 for r in self.results if r.execution_status == "error")
+        return {
+            "total": len(self.results),
+            "passed": passed,
+            "failed": failed,
+            "errors": errored,
+        }
+
 
 @dataclass
 class AnalysisContext(SerializableMixin):
@@ -429,3 +621,7 @@ class AnalysisReport(SerializableMixin):
     validation_summary: dict[str, int] = field(default_factory=dict)
     findings: list[ValidationFinding] = field(default_factory=list)
     comparisons: list[ComparisonResult] = field(default_factory=list)
+
+    # Data-validation results (dashboard value vs executed SQL).
+    sql_validations: list[SqlValidationResult] = field(default_factory=list)
+    data_validation_summary: dict[str, int] = field(default_factory=dict)

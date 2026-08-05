@@ -30,6 +30,7 @@ class ReportService:
             )
         reasoning = self._repo.load_ai_reasoning(project)
         test_cases = self._repo.load_test_cases(project)
+        data_validation = self._repo.load_data_validation(project)
 
         report = AnalysisReport(
             project_id=project.id,
@@ -46,6 +47,8 @@ class ReportService:
             validation_summary=context.validation_summary(),
             findings=context.validations,
             comparisons=context.comparisons,
+            sql_validations=data_validation.results if data_validation else [],
+            data_validation_summary=data_validation.summary() if data_validation else {},
         )
         self._repo.save_report(project, report)
 

@@ -113,6 +113,92 @@ def _visual_section(ctx: AnalysisContext) -> list[str]:
     return lines
 
 
+EXPLAIN_SYSTEM_PROMPT = (
+    "You are a BI QA analyst. You are given data-validation FAILURES where a "
+    "dashboard KPI value did not match the value computed from the database by an "
+    "already-executed SQL query. For each failure, explain the most likely root "
+    "cause and a concrete recommendation. You did not run anything; reason only over "
+    "the provided facts.\n\n"
+    "Respond with STRICT JSON (no fences): an object with key \"explanations\" whose "
+    'value is an array of {"test_id": string, "recommendation": string}.'
+)
+
+
+def build_explain_user_prompt(failures) -> str:
+    lines = ["FAILURES:"]
+    for r in failures:
+        lines.append(
+            f"- test_id={r.test_id} | KPI={r.kpi_name} | dashboard={r.dashboard_value} "
+            f"| database={r.database_value} | diff={r.difference} | reason={r.reason}"
+        )
+        if r.generated_sql:
+            lines.append(f"    SQL: {r.generated_sql}")
+    lines.append("")
+    lines.append("Return the STRICT JSON explanations now (one per test_id).")
+    return "\n".join(lines)
+
+
+PLAN_SYSTEM_PROMPT = (
+    "You are a Business Intelligence data-validation architect. You are given a list "
+    "of dashboard KPIs (with their displayed values) and the datasource SCHEMA "
+    "(tables, columns, primary/foreign keys). For EACH KPI, map it to the datasource "
+    "and generate ONE read-only SQL query that computes the KPI's value from the "
+    "database.\n\n"
+    "Hard rules:\n"
+    "- Use ONLY tables/columns present in the provided schema. Never invent names.\n"
+    "- Each query MUST be a single read-only SELECT that returns ONE scalar value "
+    "(the metric). Do NOT use INSERT/UPDATE/DELETE/DDL, and no multiple statements.\n"
+    "- Target dialect: {dialect}. For percentages, compute the percentage number so "
+    "it is comparable to the displayed value.\n"
+    "- You do NOT execute SQL. Python will run it and compare the result.\n\n"
+    "Respond with STRICT JSON (no markdown/fences): an object with key "
+    '"validation_plan" whose value is an array of objects with keys:\n'
+    '  "kpi_name": string (must match one of the given KPI names)\n'
+    '  "table": string    (schema.table used)\n'
+    '  "column": string   (primary measured column)\n'
+    '  "aggregation": string (SUM/AVG/COUNT/DISTINCTCOUNT/…)\n'
+    '  "business_meaning": string\n'
+    '  "filters": [string] (WHERE conditions applied, if any)\n'
+    '  "generated_sql": string (the single read-only SELECT)\n'
+    '  "confidence": number between 0 and 1 (mapping confidence)\n'
+)
+
+
+def build_plan_user_prompt(kpis: list[tuple[str, str]], schema_text: str, dialect: str) -> str:
+    """kpis: list of (name, displayed_value). schema_text: DbSchema.compact_text()."""
+    lines = [f"DATASOURCE DIALECT: {dialect}", "", "KPIs TO MAP:"]
+    for name, value in kpis:
+        lines.append(f"  - {name}" + (f"  (displayed: {value})" if value else ""))
+    lines += ["", "DATASOURCE SCHEMA:", schema_text or "(no schema provided)", ""]
+    lines.append(
+        "Produce the STRICT JSON validation_plan now — one item per KPI, each with a "
+        "single read-only SELECT that returns the KPI's scalar value."
+    )
+    return "\n".join(lines)
+
+
+VISION_SYSTEM_PROMPT = (
+    "You are a Business Intelligence dashboard vision analyst. You are given one or "
+    "more screenshots of a Power BI (or similar) dashboard. Extract what is visible "
+    "into STRICT JSON — no markdown, no prose, no code fences.\n\n"
+    "Read values EXACTLY as displayed (keep suffixes and symbols, e.g. '109.81M', "
+    "'11.4%', '$1,234'). Do not compute or invent values; only report what you see.\n\n"
+    "Return an object with these keys:\n"
+    '  "kpis": array of {"name": string, "value": string}  — KPI/card metrics\n'
+    '  "charts": array of {"visual_type": string, "title": string, '
+    '"fields": [string], "text": string}  — visual_type like bar_chart, line_chart, '
+    "pie/donut, table, matrix, gauge, map, treemap, slicer, card\n"
+    '  "filters": [string]  — slicer/filter names or selected values\n'
+    '  "visible_text": string  — other notable on-screen text/titles\n'
+)
+
+VISION_USER_PROMPT = (
+    "Analyse the attached dashboard screenshot(s) and return the STRICT JSON object "
+    "described in the system message. Capture every KPI card with its exact displayed "
+    "value, and every chart with its title and the fields/measures it appears to show."
+)
+
+
 TESTCASE_SYSTEM_PROMPT = (
     "You are a senior BI QA engineer. Using ONLY the deterministic analysis results "
     "provided, generate enterprise QA and developer unit test cases for the dashboard.\n\n"

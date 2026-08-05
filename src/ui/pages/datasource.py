@@ -272,6 +272,55 @@ def _render_explorer(ctx: AppContext, cfg: DatasourceConfig) -> None:
                 st.info("No rows returned.")
 
 
+def _render_schema(ctx: AppContext, project) -> None:
+    """Read + display the datasource schema (tables/columns/PK/FK)."""
+    import pandas as pd
+
+    theme.section("Database schema")
+    st.caption(
+        "Deterministically read tables, columns, primary keys and foreign keys. "
+        "This schema feeds the AI semantic mapping used for SQL validation."
+    )
+    if st.button("🗂️ Read database schema"):
+        cfg = ctx.datasource_service.load(project)
+        try:
+            with st.spinner("Reading schema…"):
+                ctx.schema_service.read_schema(project, cfg)
+            st.success("Schema read and saved.")
+        except BITestPilotError as exc:
+            st.error(str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface driver errors
+            st.error(f"Could not read schema: {exc}")
+
+    schema = ctx.schema_service.load_schema(project)
+    if not schema:
+        st.caption("No schema read yet.")
+        return
+
+    counts = schema.summary_counts()
+    c = st.columns(4)
+    c[0].metric("Tables", counts["tables"])
+    c[1].metric("Columns", counts["columns"])
+    c[2].metric("Primary keys", counts["primary_keys"])
+    c[3].metric("Foreign keys", counts["foreign_keys"])
+
+    if not schema.tables:
+        return
+    names = [t.full_name for t in schema.tables]
+    chosen = st.selectbox("Inspect table", names)
+    table = next(t for t in schema.tables if t.full_name == chosen)
+    st.dataframe(pd.DataFrame([{
+        "Column": col.name, "Type": col.data_type,
+        "Nullable": "Yes" if col.nullable else "No",
+        "PK": "🔑" if col.is_primary_key else "",
+    } for col in table.columns]), use_container_width=True, hide_index=True)
+    if table.foreign_keys:
+        st.markdown("**Foreign keys**")
+        st.dataframe(pd.DataFrame([{
+            "Column": fk.column, "References": f"{fk.ref_table}.{fk.ref_column}",
+        } for fk in table.foreign_keys]), use_container_width=True, hide_index=True)
+
+
 def render(ctx: AppContext) -> None:
     project = get_active_project()
     if project is None:
@@ -293,7 +342,11 @@ def render(ctx: AppContext) -> None:
         _last_status(cfg)
         _sql_server_form(ctx, project, cfg)
         _render_explorer(ctx, cfg)
+        if cfg.is_configured:
+            _render_schema(ctx, project)
     else:
         # Excel is fully automatic: upload → auto-read → select sheet. No manual
         # path, no Save button, no separate explorer.
         _excel_flow(ctx, project, cfg)
+        if ctx.datasource_service.load(project).is_configured:
+            _render_schema(ctx, project)

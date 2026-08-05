@@ -26,11 +26,15 @@ from pathlib import Path
 from src.core.constants import (
     AI_REASONING_FILE,
     ANALYSIS_CONTEXT_FILE,
+    DASHBOARD_EXTRACTION_FILE,
+    DATA_VALIDATION_FILE,
     DATASOURCE_FILE,
+    DB_SCHEMA_FILE,
     LLM_SETTINGS_FILE,
     METADATA_FILE,
     PROJECT_FILE,
     TEST_CASES_FILE,
+    VALIDATION_PLAN_FILE,
     VISUAL_ANALYSIS_FILE,
     ProjectFolder,
 )
@@ -40,11 +44,15 @@ from src.domain.models import (
     AIReasoning,
     AnalysisContext,
     AnalysisReport,
+    DashboardExtraction,
     DashboardMetadata,
+    DataValidationRun,
     DatasourceConfig,
+    DbSchema,
     LLMSettings,
     Project,
     TestCase,
+    ValidationPlan,
     VisualAnalysis,
 )
 from src.storage import file_manager as fm
@@ -123,6 +131,22 @@ class ProjectPaths:
     @property
     def test_cases_file(self) -> Path:
         return self.test_cases_dir / TEST_CASES_FILE
+
+    @property
+    def dashboard_extraction_file(self) -> Path:
+        return self.metadata_dir / DASHBOARD_EXTRACTION_FILE
+
+    @property
+    def validation_plan_file(self) -> Path:
+        return self.metadata_dir / VALIDATION_PLAN_FILE
+
+    @property
+    def data_validation_file(self) -> Path:
+        return self.reports_dir / DATA_VALIDATION_FILE
+
+    @property
+    def db_schema_file(self) -> Path:
+        return self.configuration_dir / DB_SCHEMA_FILE
 
     def all_folders(self) -> list[Path]:
         return [
@@ -281,6 +305,52 @@ class ProjectRepository:
             return []
         data = fm.read_json(paths.test_cases_file)
         return [TestCase.from_dict(tc) for tc in data.get("test_cases", [])]
+
+    # --- datasource schema (redesign) -------------------------------------
+    def save_db_schema(self, project: Project, schema: DbSchema) -> None:
+        paths = self.paths_for(project)
+        fm.ensure_dir(paths.configuration_dir)
+        fm.write_json(paths.db_schema_file, schema.to_dict())
+
+    def load_db_schema(self, project: Project) -> DbSchema | None:
+        paths = self.paths_for(project)
+        if not paths.db_schema_file.exists():
+            return None
+        return DbSchema.from_dict(fm.read_json(paths.db_schema_file))
+
+    # --- dashboard understanding & data validation (redesign) -------------
+    def save_dashboard_extraction(self, project: Project, extraction: DashboardExtraction) -> None:
+        paths = self.paths_for(project)
+        fm.ensure_dir(paths.metadata_dir)
+        fm.write_json(paths.dashboard_extraction_file, extraction.to_dict())
+
+    def load_dashboard_extraction(self, project: Project) -> DashboardExtraction | None:
+        paths = self.paths_for(project)
+        if not paths.dashboard_extraction_file.exists():
+            return None
+        return DashboardExtraction.from_dict(fm.read_json(paths.dashboard_extraction_file))
+
+    def save_validation_plan(self, project: Project, plan: ValidationPlan) -> None:
+        paths = self.paths_for(project)
+        fm.ensure_dir(paths.metadata_dir)
+        fm.write_json(paths.validation_plan_file, plan.to_dict())
+
+    def load_validation_plan(self, project: Project) -> ValidationPlan | None:
+        paths = self.paths_for(project)
+        if not paths.validation_plan_file.exists():
+            return None
+        return ValidationPlan.from_dict(fm.read_json(paths.validation_plan_file))
+
+    def save_data_validation(self, project: Project, run: DataValidationRun) -> None:
+        paths = self.paths_for(project)
+        fm.ensure_dir(paths.reports_dir)
+        fm.write_json(paths.data_validation_file, run.to_dict())
+
+    def load_data_validation(self, project: Project) -> DataValidationRun | None:
+        paths = self.paths_for(project)
+        if not paths.data_validation_file.exists():
+            return None
+        return DataValidationRun.from_dict(fm.read_json(paths.data_validation_file))
 
     def save_analysis_context(self, project: Project, context: AnalysisContext) -> None:
         paths = self.paths_for(project)

@@ -71,6 +71,11 @@ class DatasourceConnector(abc.ABC):
         """Return the row count for *dataset*."""
         raise NotImplementedError
 
+    def get_schema(self):
+        """Return a :class:`~src.domain.models.DbSchema` for this datasource
+        (tables, columns, primary/foreign keys). Concrete connectors override."""
+        raise NotImplementedError
+
     # Shared helper: stringify a row so results are JSON-serializable.
     @staticmethod
     def _stringify_row(row) -> list[str]:

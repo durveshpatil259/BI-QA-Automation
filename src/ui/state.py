@@ -22,9 +22,14 @@ from src.services.llm_service import LLMService
 from src.services.metadata_service import MetadataService
 from src.services.project_service import ProjectService
 from src.services.reporting import ReportService
+from src.services.schema_service import SchemaService
 from src.services.screenshot_service import ScreenshotService
+from src.services.sql_validation_engine import SqlValidationEngine
 from src.services.test_case_service import TestCaseService
+from src.services.test_expansion_service import TestExpansionService
 from src.services.upload_service import UploadService
+from src.services.validation_plan_service import ValidationPlanService
+from src.services.vision_service import VisionService
 from src.storage.project_repository import ProjectRepository
 
 # session-state keys (centralised to avoid typos across pages)
@@ -48,6 +53,11 @@ class AppContext:
     llm_service: LLMService
     test_case_service: TestCaseService
     report_service: ReportService
+    schema_service: SchemaService
+    vision_service: VisionService
+    validation_plan_service: ValidationPlanService
+    sql_validation_engine: SqlValidationEngine
+    test_expansion_service: TestExpansionService
 
     @classmethod
     def create(cls) -> "AppContext":
@@ -66,6 +76,11 @@ class AppContext:
             llm_service=LLMService(repo),
             test_case_service=TestCaseService(repo),
             report_service=ReportService(repo),
+            schema_service=SchemaService(repo),
+            vision_service=VisionService(repo),
+            validation_plan_service=ValidationPlanService(repo),
+            sql_validation_engine=SqlValidationEngine(repo),
+            test_expansion_service=TestExpansionService(repo),
         )
 
 

@@ -46,3 +46,19 @@ class LLMClient(abc.ABC):
     # Convenience for the common system+user pattern.
     def complete(self, system: str, user: str) -> LLMResponse:
         return self.chat([LLMMessage("system", system), LLMMessage("user", user)])
+
+    def vision_complete(
+        self,
+        system: str,
+        user: str,
+        images: list[bytes],
+        *,
+        image_formats: list[str] | None = None,
+    ) -> LLMResponse:
+        """Send a system+user prompt together with one or more images.
+
+        Only vision-capable providers/models support this; others raise.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support image input."
+        )
