@@ -40,9 +40,11 @@ class MetadataService:
             raise MetadataExtractionError(
                 "No dashboard file uploaded. Add one on the Upload page first."
             )
-        # Prefer a real package over a bare pointer file if several exist.
-        priority = {".pbix": 0, ".pbit": 0, ".zip": 1, ".pbip": 2, ".pbir": 2}
-        files.sort(key=lambda p: priority.get(p.suffix.lower(), 3))
+        # Prefer formats with a *readable* model. .pbit/.pbip/.pbir/.zip store the
+        # model as text (DataModelSchema/TMDL); a native .pbix has a binary model
+        # and yields no tables — so it is the last resort when several exist.
+        priority = {".pbit": 0, ".pbip": 1, ".pbir": 1, ".zip": 2, ".pbix": 3}
+        files.sort(key=lambda p: priority.get(p.suffix.lower(), 4))
         return files[0]
 
     def extract(self, project: Project) -> DashboardMetadata:
