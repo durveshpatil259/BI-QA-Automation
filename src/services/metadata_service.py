@@ -1,0 +1,61 @@
+"""Metadata extraction service.
+
+Selects the project's dashboard file, runs the platform-appropriate extractor,
+persists the resulting :class:`DashboardMetadata` to
+``Metadata/dashboard_metadata.json``, and exposes load access for the UI and the
+downstream comparison/validation engines.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from src.core.exceptions import MetadataExtractionError
+from src.core.logger import get_logger
+from src.domain.models import DashboardMetadata, Project
+from src.services.extractors import create_extractor
+from src.storage.project_repository import ProjectRepository
+
+_logger = get_logger()
+
+
+class MetadataService:
+    """Runs and persists dashboard metadata extraction for a project."""
+
+    def __init__(self, repository: ProjectRepository):
+        self._repo = repository
+
+    def has_dashboard_file(self, project: Project) -> bool:
+        return bool(self._dashboard_files(project))
+
+    def _dashboard_files(self, project: Project) -> list[Path]:
+        paths = self._repo.paths_for(project)
+        from src.storage import file_manager as fm
+
+        return fm.list_dir(paths.dashboard_dir)
+
+    def _select_primary_file(self, project: Project) -> Path:
+        files = self._dashboard_files(project)
+        if not files:
+            raise MetadataExtractionError(
+                "No dashboard file uploaded. Add one on the Upload page first."
+            )
+        # Prefer a real package over a bare pointer file if several exist.
+        priority = {".pbix": 0, ".pbit": 0, ".zip": 1, ".pbip": 2, ".pbir": 2}
+        files.sort(key=lambda p: priority.get(p.suffix.lower(), 3))
+        return files[0]
+
+    def extract(self, project: Project) -> DashboardMetadata:
+        """Extract metadata from the project's primary dashboard file and save."""
+        source = self._select_primary_file(project)
+        extractor = create_extractor(project.bi_platform)
+        _logger.info(
+            "Extracting metadata: project=%s platform=%s file=%s",
+            project.id, project.bi_platform, source.name,
+        )
+        metadata = extractor.extract(source)
+        self._repo.save_metadata(project, metadata)
+        return metadata
+
+    def load(self, project: Project) -> DashboardMetadata | None:
+        return self._repo.load_metadata(project)

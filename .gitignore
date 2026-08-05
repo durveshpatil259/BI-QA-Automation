@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# App data (local project storage & logs stay on the machine)
+projects/
+config/app.log*
+config/app_config.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

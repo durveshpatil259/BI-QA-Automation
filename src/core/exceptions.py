@@ -1,0 +1,78 @@
+"""Custom exception hierarchy for BI TestPilot AI.
+
+A single base exception (:class:`BITestPilotError`) lets the UI layer catch and
+present all domain/service failures uniformly, while specific subclasses allow
+targeted handling where it matters (e.g. distinguishing a datasource
+connection failure from a parsing failure).
+"""
+
+from __future__ import annotations
+
+
+class BITestPilotError(Exception):
+    """Base class for all application-specific errors."""
+
+
+# --- Storage / project layer ----------------------------------------------
+class StorageError(BITestPilotError):
+    """Raised for filesystem / persistence failures."""
+
+
+class ProjectNotFoundError(StorageError):
+    """Raised when a requested project does not exist on disk."""
+
+
+class ProjectAlreadyExistsError(StorageError):
+    """Raised when creating a project whose name/id already exists."""
+
+
+# --- Ingestion / parsing ---------------------------------------------------
+class UploadError(BITestPilotError):
+    """Raised when an uploaded asset is invalid or cannot be stored."""
+
+
+class MetadataExtractionError(BITestPilotError):
+    """Raised when a dashboard file cannot be parsed into metadata."""
+
+
+class UnsupportedPlatformError(MetadataExtractionError):
+    """Raised when no extractor is registered for a BI platform/file type."""
+
+
+# --- Datasource ------------------------------------------------------------
+class DatasourceError(BITestPilotError):
+    """Base for datasource configuration/connection failures."""
+
+
+class DatasourceConnectionError(DatasourceError):
+    """Raised when a datasource cannot be reached or authenticated."""
+
+
+class DatasourceConfigError(DatasourceError):
+    """Raised when a datasource configuration is invalid/incomplete."""
+
+
+# --- Analysis pipeline -----------------------------------------------------
+class ValidationError(BITestPilotError):
+    """Raised for failures inside the deterministic validation engine."""
+
+
+class ComparisonError(BITestPilotError):
+    """Raised for failures inside the deterministic comparison engine."""
+
+
+# --- LLM layer -------------------------------------------------------------
+class LLMError(BITestPilotError):
+    """Base for LLM abstraction-layer failures."""
+
+
+class LLMConfigError(LLMError):
+    """Raised when an LLM provider is misconfigured (e.g. missing API key)."""
+
+
+class LLMProviderError(LLMError):
+    """Raised when an LLM provider call fails (network / API error)."""
+
+
+class LLMResponseError(LLMError):
+    """Raised when an LLM returns an unusable/unparseable response."""
