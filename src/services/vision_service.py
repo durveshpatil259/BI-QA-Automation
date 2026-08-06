@@ -17,7 +17,9 @@ from src.core.exceptions import LLMResponseError, ValidationError
 from src.core.logger import get_logger
 from src.domain.models import (
     DashboardExtraction,
+    DashboardFilter,
     DashboardKPI,
+    DashboardView,
     DetectedVisual,
     LLMSettings,
     Project,
@@ -60,23 +62,40 @@ class VisionService:
         settings = settings or (self._repo.load_llm_settings(project) or LLMSettings())
         client = client or create_client(settings)
 
-        images, formats = self._load_images(project)
-        if not images:
+        paths = self._repo.paths_for(project)
+        files = fm.list_dir(paths.screenshots_dir, SCREENSHOT_EXTENSIONS)[:_MAX_IMAGES]
+        if not files:
             raise ValidationError("No screenshots to analyse. Upload some first.")
 
-        response = client.vision_complete(
-            VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, images, image_formats=formats
-        )
-        extraction = self._parse(response.content)
-        extraction.source = "screenshot"
-        extraction.provider = settings.provider
-        extraction.model = response.model or client.model
-        extraction.raw_response = response.content
+        extraction = DashboardExtraction(source="screenshot", provider=settings.provider)
+        raw_parts: list[str] = []
 
+        # One request per screenshot: each image is a distinct filter scenario,
+        # so its KPIs must stay bound to the slicer values shown in THAT image.
+        for path in files:
+            data, fmt = self._downscale(path)
+            response = client.vision_complete(
+                VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, [data], image_formats=[fmt]
+            )
+            extraction.model = response.model or client.model
+            raw_parts.append(f"--- {path.name} ---\n{response.content}")
+            view = self._parse_view(response.content, path.name)
+            extraction.views.append(view)
+
+            # Flatten for back-compat displays.
+            extraction.kpis.extend(view.kpis)
+            extraction.visuals.extend(view.visuals)
+            for f in view.filter_selections:
+                extraction.filters.append(f.name)
+                extraction.filter_selections.append(f)
+            if view.visible_text and not extraction.visible_text:
+                extraction.visible_text = view.visible_text
+
+        extraction.raw_response = "\n\n".join(raw_parts)
         self._repo.save_dashboard_extraction(project, extraction)
         _logger.info(
-            "Vision extraction for %s: %d KPI(s), %d visual(s)",
-            project.id, len(extraction.kpis), len(extraction.visuals),
+            "Vision extraction for %s: %d view(s), %d KPI(s) total",
+            project.id, len(extraction.views), len(extraction.kpis),
         )
         return extraction
 
@@ -114,14 +133,14 @@ class VisionService:
             return raw, path.suffix.lstrip(".").lower() or "png"
 
     # --- response parsing -------------------------------------------------
-    def _parse(self, content: str) -> DashboardExtraction:
+    def _parse_view(self, content: str, view_name: str) -> DashboardView:
         data = extract_json(content)
         if not isinstance(data, dict):
             raise LLMResponseError(
                 "The vision model did not return the expected JSON object. "
                 "Ensure the selected model supports image input."
             )
-        extraction = DashboardExtraction()
+        extraction = DashboardView(name=view_name)
 
         for k in data.get("kpis", []) or []:
             if not isinstance(k, dict):
@@ -148,7 +167,18 @@ class VisionService:
                 source="screenshot",
             ))
 
-        filters = data.get("filters", []) or []
-        extraction.filters = [str(f).strip() for f in filters if str(f).strip()]
+        # Filters may arrive as plain names (older prompt) or as
+        # {"name", "selected"} objects — accept both.
+        for f in data.get("filters", []) or []:
+            if isinstance(f, dict):
+                name = str(f.get("name", "")).strip()
+                selected = str(f.get("selected", f.get("value", ""))).strip()
+            else:
+                name, selected = str(f).strip(), ""
+            if not name:
+                continue
+            extraction.filter_selections.append(
+                DashboardFilter(name=name, selected=selected)
+            )
         extraction.visible_text = str(data.get("visible_text", "")).strip()
         return extraction

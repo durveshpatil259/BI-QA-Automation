@@ -104,6 +104,57 @@ class ComparisonOutcome:
     difference_pct: float | None        # absolute percentage difference
     difference_display: str             # formatted signed difference
     reason: str
+    match_type: str = ""                # "exact" | "numeric" | ""
+
+
+def normalize_display(value) -> str:
+    """Normalise a displayed value for exact string comparison.
+
+    Ignores only cosmetic differences (case, spaces, thousands separators) so
+    ``$51.88M`` and ``$ 51.88 M`` are treated as the same displayed value, while
+    ``51.88M`` vs ``51.9M`` remain different.
+    """
+    s = str(value or "").strip()
+    for ch in (" ", " ", ",", "\t"):
+        s = s.replace(ch, "")
+    return s.casefold()
+
+
+def compare_display_values(
+    dashboard_raw,
+    database_raw,
+    *,
+    tolerance_pct: float = 1.0,
+) -> ComparisonOutcome:
+    """Compare a dashboard value to a database value, format-first.
+
+    1. If the database returned the **same displayed string** (e.g. the SQL
+       formatted its result as ``$51.88M``), that is an exact match — the
+       strongest possible signal, and no numeric conversion is involved.
+    2. Otherwise fall back to numeric comparison with a tolerance, so a raw
+       aggregate like ``51879473.12`` still validates against ``$51.88M``.
+    """
+    dash_disp, db_disp = normalize_display(dashboard_raw), normalize_display(database_raw)
+    if dash_disp and dash_disp == db_disp:
+        return ComparisonOutcome(
+            passed=True, difference=0.0, difference_pct=0.0, difference_display="0",
+            reason=(
+                f"Exact format match: database returned '{database_raw}', "
+                f"identical to the dashboard display."
+            ),
+            match_type="exact",
+        )
+
+    dash_num, _ = parse_value(dashboard_raw)
+    db_num, _ = parse_value(database_raw)
+    outcome = compare_values(dash_num, db_num, tolerance_pct=tolerance_pct)
+    if outcome.passed:
+        outcome.match_type = "numeric"
+        outcome.reason = (
+            f"Numeric match within tolerance (display differs: dashboard "
+            f"'{dashboard_raw}' vs database '{database_raw}'). " + outcome.reason
+        )
+    return outcome
 
 
 def _fmt(n: float) -> str:

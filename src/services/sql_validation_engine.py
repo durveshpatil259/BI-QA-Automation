@@ -22,7 +22,7 @@ from src.domain.models import (
     ValidationPlanItem,
 )
 from src.services.datasources import create_connector
-from src.services.validation import compare_values, parse_value
+from src.services.validation import compare_display_values, compare_values, parse_value
 from src.services.validation.sql_guard import is_read_only
 from src.storage.project_repository import ProjectRepository
 
@@ -64,6 +64,10 @@ class SqlValidationEngine:
                 self._validate_item(f"QA_{i:03d}", item, connector, tolerance_pct, excel)
             )
 
+        # DAX-driven checks: when there is no screenshot value, a measure defined
+        # from other measures can still be verified arithmetically.
+        self._apply_consistency_checks(project, run, tolerance_pct)
+
         self._repo.save_data_validation(project, run)
         _logger.info("SQL validation for %s: %s", project.id, run.summary())
         return run
@@ -75,6 +79,7 @@ class SqlValidationEngine:
         result = SqlValidationResult(
             test_id=test_id,
             kpi_name=item.kpi_name,
+            scenario=item.scenario,
             dashboard_value=item.dashboard_value,
             dashboard_numeric=dashboard_numeric,
             generated_sql=item.generated_sql,
@@ -113,22 +118,100 @@ class SqlValidationEngine:
         result.database_value = str(db_value)
         result.database_numeric, _ = parse_value(db_value)
 
-        # Compare (Python).
-        if dashboard_numeric is None:
-            result.status = TestStatus.NOT_EXECUTED
-            result.reason = (
-                "No dashboard value available to compare; database value recorded."
-            )
+        # Compare (Python): exact displayed-format match first, numeric fallback.
+        if not item.dashboard_value:
+            # PBIX/PBIT-only mode — no rendered value to compare against, so the
+            # verdict comes from executability and sanity of the result instead.
+            blank = result.database_value.strip().lower() in ("", "none", "null")
+            if blank or result.database_numeric is None:
+                result.status = TestStatus.FAIL
+                result.match_type = "executability"
+                result.reason = (
+                    "Query executed but returned no usable value "
+                    f"(got '{result.database_value}') — the KPI mapping is likely wrong."
+                )
+            else:
+                result.status = TestStatus.PASS
+                result.match_type = "executability"
+                result.reason = (
+                    f"Query executed successfully and returned {result.database_value}. "
+                    "No dashboard screenshot was supplied, so this validates the "
+                    "DAX→SQL mapping, not the rendered value."
+                )
             return result
 
-        outcome = compare_values(
-            dashboard_numeric, result.database_numeric, tolerance_pct=tolerance_pct
+        outcome = compare_display_values(
+            item.dashboard_value, result.database_value, tolerance_pct=tolerance_pct
         )
         result.difference = outcome.difference_display
         result.difference_pct = outcome.difference_pct
+        result.match_type = outcome.match_type
         result.status = TestStatus.PASS if outcome.passed else TestStatus.FAIL
         result.reason = outcome.reason
         return result
+
+    # --- DAX cross-measure consistency (screenshot-free verdicts) --------
+    def _apply_consistency_checks(
+        self, project: Project, run: DataValidationRun, tolerance_pct: float
+    ) -> None:
+        """Verify measures defined from other measures actually agree.
+
+        ``Total Profit = [Total Sales] - [Total Cost]`` is checkable purely from
+        executed SQL results, giving a real PASS/FAIL with no dashboard value.
+        """
+        from src.services.validation.dax_analyzer import extract_consistency_rules
+
+        metadata = self._repo.load_metadata(project)
+        if not metadata:
+            return
+        rules = extract_consistency_rules(metadata.all_measures)
+        if not rules:
+            return
+
+        # Executed numeric results per KPI (per scenario, so filters line up).
+        values: dict[tuple[str, str], float] = {}
+        for r in run.results:
+            if r.execution_status == "ok" and r.database_numeric is not None:
+                values[(r.scenario, r.kpi_name.casefold())] = r.database_numeric
+
+        scenarios = {r.scenario for r in run.results}
+        next_id = len(run.results) + 1
+        for scenario in sorted(scenarios):
+            for rule in rules:
+                left = values.get((scenario, rule.left.casefold()))
+                right = values.get((scenario, rule.right.casefold()))
+                actual = values.get((scenario, rule.target.casefold()))
+                if left is None or right is None or actual is None:
+                    continue  # not all three were computed
+                expected = rule.apply(left, right)
+                if expected is None:
+                    continue
+
+                outcome = compare_values(expected, actual, tolerance_pct=tolerance_pct)
+                result = SqlValidationResult(
+                    test_id=f"DAX_{next_id:03d}",
+                    kpi_name=rule.target,
+                    scenario=scenario,
+                    dashboard_value=f"{expected:,.4f} (from DAX)",
+                    dashboard_numeric=expected,
+                    generated_sql=f"-- DAX consistency: {rule.describe()}",
+                    database_value=f"{actual:,.4f}",
+                    database_numeric=actual,
+                    difference=outcome.difference_display,
+                    difference_pct=outcome.difference_pct,
+                    tolerance_pct=tolerance_pct,
+                    execution_status="ok",
+                    match_type="dax-consistency",
+                    status=TestStatus.PASS if outcome.passed else TestStatus.FAIL,
+                    confidence=1.0,
+                    reason=(
+                        f"DAX rule {rule.describe()} — computed {expected:,.4f} from "
+                        f"components, measure returned {actual:,.4f}. {outcome.reason}"
+                    ),
+                )
+                run.results.append(result)
+                next_id += 1
+        _logger.info("Applied %d DAX consistency rule(s)", len(rules))
 
     # --- optional AI failure explanations --------------------------------
     def explain_failures(

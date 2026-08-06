@@ -194,7 +194,53 @@ class SqlServerConnector(DatasourceConnector):
                 "JOIN sys.schemas rsch ON rsch.schema_id = tr.schema_id "
                 "JOIN sys.columns cr ON cr.object_id = tr.object_id AND cr.column_id = fkc.referenced_column_id"
             )).fetchall()
-        return self._assemble_schema(str(db), tables, columns, pks, fks)
+        schema = self._assemble_schema(str(db), tables, columns, pks, fks)
+        self._profile_sample_values(schema)
+        from src.services.validation.join_inference import infer_join_hints
+
+        schema.join_hints = infer_join_hints(schema)
+        return schema
+
+    # Text columns whose distinct values are worth showing the AI so it can
+    # write literal-accurate WHERE clauses (e.g. 'FY2020').
+    _PROFILE_TYPES = ("char", "nchar", "varchar", "nvarchar", "text", "ntext")
+    _PROFILE_MAX_DISTINCT = 25
+    _PROFILE_MAX_COLUMNS = 60
+
+    def _profile_sample_values(self, schema) -> None:
+        """Attach a few real distinct values to low-cardinality text columns."""
+        from sqlalchemy import text
+
+        profiled = 0
+        try:
+            engine = self._get_engine()
+            with engine.connect() as conn:
+                for table in schema.tables:
+                    for col in table.columns:
+                        if profiled >= self._PROFILE_MAX_COLUMNS:
+                            return
+                        if not any(p in col.data_type.lower() for p in self._PROFILE_TYPES):
+                            continue
+                        qualified = (
+                            f"{self._bracket(table.schema)}.{self._bracket(table.name)}"
+                        )
+                        column = self._bracket(col.name)
+                        sql = (
+                            f"SELECT DISTINCT TOP {self._PROFILE_MAX_DISTINCT} {column} "
+                            f"FROM {qualified} WHERE {column} IS NOT NULL "
+                            f"ORDER BY {column}"
+                        )
+                        try:
+                            rows = conn.execute(text(sql)).fetchall()
+                        except Exception:  # noqa: BLE001 - skip unprofilable column
+                            continue
+                        profiled += 1
+                        # Only keep genuinely low-cardinality columns; a column
+                        # at the cap is likely free text (names, addresses).
+                        if 0 < len(rows) < self._PROFILE_MAX_DISTINCT:
+                            col.sample_values = [str(r[0]) for r in rows]
+        except Exception as exc:  # noqa: BLE001 - profiling is best-effort
+            schema.warnings.append(f"Could not profile sample values: {exc}")
 
     @staticmethod
     def _assemble_schema(database, table_rows, column_rows, pk_rows, fk_rows):

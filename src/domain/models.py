@@ -362,6 +362,26 @@ class DbColumn(SerializableMixin):
     data_type: str = ""
     nullable: bool = True
     is_primary_key: bool = False
+    # A few real distinct values, profiled for low-cardinality text columns.
+    # Critical for AI SQL generation: it must know a fiscal year literal looks
+    # like 'FY2020' (not 2020) before it can write a correct WHERE clause.
+    sample_values: list[str] = field(default_factory=list)
+
+
+@dataclass
+class JoinHint(SerializableMixin):
+    """An inferred join path between two tables.
+
+    Real foreign keys are often absent (e.g. tables imported from CSV), so the
+    schema reader infers likely joins from key-column naming. These hints are
+    given to the AI so it can write correct multi-table queries.
+    """
+
+    from_table: str = ""
+    from_column: str = ""
+    to_table: str = ""
+    to_column: str = ""
+    inferred: bool = True        # False when it came from a declared FK
 
 
 @dataclass
@@ -394,6 +414,7 @@ class DbSchema(SerializableMixin):
     datasource_type: DatasourceType | None = None
     database: str = ""
     tables: list[DbTable] = field(default_factory=list)
+    join_hints: list[JoinHint] = field(default_factory=list)
     generated_at: _dt.datetime = field(default_factory=_now)
     warnings: list[str] = field(default_factory=list)
 
@@ -406,20 +427,37 @@ class DbSchema(SerializableMixin):
         }
 
     def compact_text(self, max_tables: int = 60) -> str:
-        """A compact textual rendering for inclusion in an AI prompt."""
-        lines: list[str] = []
+        """A compact textual rendering for inclusion in an AI prompt.
+
+        Includes real sample values and inferred join paths — without these the
+        model cannot write correct WHERE clauses or multi-table joins.
+        """
+        lines: list[str] = ["TABLES:"]
         for t in self.tables[:max_tables]:
-            cols = ", ".join(
-                f"{c.name}:{c.data_type}" + ("(PK)" if c.is_primary_key else "")
-                for c in t.columns
-            )
-            lines.append(f"{t.full_name} [{t.kind}] — {cols}")
+            lines.append(f"  {t.full_name} [{t.kind}]"
+                         + (f" ~{t.row_count} rows" if t.row_count is not None else ""))
+            for c in t.columns:
+                marks = " (PK)" if c.is_primary_key else ""
+                samples = ""
+                if c.sample_values:
+                    shown = ", ".join(repr(v) for v in c.sample_values[:6])
+                    samples = f"  e.g. {shown}"
+                lines.append(f"      {c.name}: {c.data_type}{marks}{samples}")
             for fk in t.foreign_keys:
                 lines.append(
-                    f"    FK {t.full_name}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
+                    f"      FK {t.full_name}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
                 )
         if len(self.tables) > max_tables:
-            lines.append(f"… and {len(self.tables) - max_tables} more tables")
+            lines.append(f"  … and {len(self.tables) - max_tables} more tables")
+
+        if self.join_hints:
+            lines.append("")
+            lines.append("JOIN PATHS (use these to join fact and dimension tables):")
+            for j in self.join_hints:
+                tag = " [inferred from naming]" if j.inferred else " [declared FK]"
+                lines.append(
+                    f"  {j.from_table}.{j.from_column} = {j.to_table}.{j.to_column}{tag}"
+                )
         return "\n".join(lines)
 
 
@@ -451,13 +489,64 @@ class DetectedVisual(SerializableMixin):
 
 
 @dataclass
+class DashboardFilter(SerializableMixin):
+    """A slicer/filter and its currently-selected value(s).
+
+    The selection is essential context: a KPI reading 51.88M under
+    ``Fiscal Year = FY2020`` must be validated with that same WHERE clause.
+    """
+
+    name: str = ""
+    selected: str = ""               # e.g. "FY2020", "All"
+
+    @property
+    def is_active(self) -> bool:
+        """True when the slicer narrows the data (i.e. not 'All'/blank)."""
+        s = self.selected.strip().casefold()
+        return bool(s) and s not in ("all", "(all)", "none", "-")
+
+
+@dataclass
+class DashboardView(SerializableMixin):
+    """One screenshot = one filter scenario.
+
+    A dashboard shows different numbers under different slicer selections, so
+    each screenshot is captured as its own view: the filters that were applied
+    when it was taken, and the KPI values displayed under them. Uploading one
+    screenshot per fiscal year therefore yields one validation scenario per year.
+    """
+
+    name: str = ""                   # source screenshot file name
+    kpis: list[DashboardKPI] = field(default_factory=list)
+    visuals: list[DetectedVisual] = field(default_factory=list)
+    filter_selections: list[DashboardFilter] = field(default_factory=list)
+    visible_text: str = ""
+
+    def active_filters(self) -> list[DashboardFilter]:
+        return [f for f in self.filter_selections if f.is_active]
+
+    def scenario_label(self) -> str:
+        """Human label for this filter scenario, e.g. 'Fiscal Year=FY2020'."""
+        active = self.active_filters()
+        if not active:
+            return "No filters"
+        return ", ".join(f"{f.name}={f.selected}" for f in active)
+
+
+@dataclass
 class DashboardExtraction(SerializableMixin):
     """Structured understanding of a dashboard, from AI vision and/or metadata."""
 
     source: str = ""                 # "screenshot" | "pbix" | "combined"
+    views: list[DashboardView] = field(default_factory=list)
+    # Flattened across all views (kept for back-compat and simple displays).
     kpis: list[DashboardKPI] = field(default_factory=list)
     visuals: list[DetectedVisual] = field(default_factory=list)
     filters: list[str] = field(default_factory=list)
+    filter_selections: list[DashboardFilter] = field(default_factory=list)
+
+    def active_filters(self) -> list[DashboardFilter]:
+        return [f for f in self.filter_selections if f.is_active]
     visible_text: str = ""
     generated_at: _dt.datetime = field(default_factory=_now)
     provider: LLMProvider | None = None
@@ -479,6 +568,10 @@ class ValidationPlanItem(SerializableMixin):
     filters: list[str] = field(default_factory=list)
     generated_sql: str = ""          # the SQL Python will execute
     confidence: float = 0.0
+    # Which filter scenario (screenshot/view) this item validates, e.g.
+    # "Fiscal Year=FY2020" — so the same KPI can be validated per year.
+    scenario: str = ""
+    view_name: str = ""
 
 
 @dataclass
@@ -516,6 +609,10 @@ class SqlValidationResult(SerializableMixin):
     reason: str = ""
     recommendation: str = ""
     confidence: float = 0.0
+    # "exact" when the database returned the dashboard's displayed string
+    # verbatim; "numeric" when it matched only after numeric normalisation.
+    match_type: str = ""
+    scenario: str = ""               # filter scenario validated, e.g. FY2020
 
 
 @dataclass

@@ -99,13 +99,24 @@ class ExcelConnector(DatasourceConnector):
         with pd.ExcelFile(path) as xls:
             for name in xls.sheet_names:
                 df = pd.read_excel(xls, sheet_name=name)
-                cols = [
-                    DbColumn(name=str(c), data_type=str(df[c].dtype)) for c in df.columns
-                ]
+                cols = []
+                for c in df.columns:
+                    col = DbColumn(name=str(c), data_type=str(df[c].dtype))
+                    # Profile low-cardinality columns so the AI sees real literals.
+                    try:
+                        distinct = df[c].dropna().unique()
+                        if 0 < len(distinct) < 25:
+                            col.sample_values = [str(v) for v in distinct[:25]]
+                    except Exception:  # noqa: BLE001 - unhashable/odd dtypes
+                        pass
+                    cols.append(col)
                 schema.tables.append(DbTable(
                     schema="", name=str(name), kind="sheet",
                     columns=cols, row_count=int(len(df)),
                 ))
+        from src.services.validation.join_inference import infer_join_hints
+
+        schema.join_hints = infer_join_hints(schema)
         return schema
 
     def get_columns(self, dataset: str) -> list[str]:

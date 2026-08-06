@@ -45,27 +45,111 @@ class ValidationPlanService:
         return self._repo.load_validation_plan(project)
 
     # --- inputs -----------------------------------------------------------
-    def _collect_targets(self, project: Project) -> list[tuple[str, str]]:
-        """Return [(kpi_name, displayed_value)] from vision extraction, falling
-        back to model measures if no screenshot extraction exists."""
-        targets: list[tuple[str, str]] = []
+    def _collect_targets(self, project: Project) -> list[tuple[str, str, str]]:
+        """Return [(kpi_name, displayed_value, dax)] for the AI to map.
+
+        Screenshot KPIs supply the displayed value; the model's measures supply
+        the DAX formula. When both exist they are merged per KPI so the AI knows
+        *what the number is* and *how it is calculated*.
+        """
+        metadata = self._repo.load_metadata(project)
+        dax_by_name: dict[str, str] = {}
+        if metadata:
+            for m in metadata.all_measures:
+                if m.name:
+                    dax_by_name.setdefault(m.name.casefold(), m.dax_expression or "")
+
+        targets: list[tuple[str, str, str]] = []
         seen: set[str] = set()
 
         extraction = self._repo.load_dashboard_extraction(project)
         if extraction:
             for k in extraction.kpis:
                 if k.name and k.name.casefold() not in seen:
-                    targets.append((k.name, k.raw_value))
+                    targets.append((k.name, k.raw_value, dax_by_name.get(k.name.casefold(), "")))
                     seen.add(k.name.casefold())
 
-        if not targets:
-            metadata = self._repo.load_metadata(project)
-            if metadata:
-                for m in metadata.all_measures:
-                    if m.name and m.name.casefold() not in seen:
-                        targets.append((m.name, ""))
-                        seen.add(m.name.casefold())
+        if not targets and metadata:
+            for m in metadata.all_measures:
+                if m.name and m.name.casefold() not in seen:
+                    targets.append((m.name, "", m.dax_expression or ""))
+                    seen.add(m.name.casefold())
         return targets
+
+    def _build_scenarios(self, project: Project) -> list[dict]:
+        """One scenario per screenshot view (each has its own slicer selection).
+
+        Falls back to a single unfiltered scenario built from model measures when
+        no screenshots were analysed.
+        """
+        from src.services.validation.dax_analyzer import describe_format
+
+        metadata = self._repo.load_metadata(project)
+        dax_by_name: dict[str, str] = {}
+        fmt_by_name: dict[str, str] = {}
+        if metadata:
+            for m in metadata.all_measures:
+                if m.name:
+                    dax_by_name.setdefault(m.name.casefold(), m.dax_expression or "")
+                    fmt_by_name.setdefault(
+                        m.name.casefold(), describe_format(m.format_string)
+                    )
+
+        extraction = self._repo.load_dashboard_extraction(project)
+        scenarios: list[dict] = []
+
+        if extraction and extraction.views:
+            for i, view in enumerate(extraction.views, start=1):
+                kpis = [
+                    (k.name, k.raw_value, dax_by_name.get(k.name.casefold(), ""))
+                    for k in view.kpis if k.name
+                ]
+                if not kpis:
+                    continue
+                scenarios.append({
+                    "id": f"S{i}",
+                    "label": view.scenario_label(),
+                    "view_name": view.name,
+                    "filters": [(f.name, f.selected) for f in view.active_filters()],
+                    "kpis": kpis,
+                })
+
+        if not scenarios and extraction and extraction.kpis:
+            # Older extraction without per-view data.
+            scenarios.append({
+                "id": "S1",
+                "label": ", ".join(
+                    f"{f.name}={f.selected}" for f in extraction.active_filters()
+                ) or "No filters",
+                "view_name": "",
+                "filters": [(f.name, f.selected) for f in extraction.active_filters()],
+                "kpis": [
+                    (k.name, k.raw_value, dax_by_name.get(k.name.casefold(), ""))
+                    for k in extraction.kpis if k.name
+                ],
+            })
+
+        if not scenarios and metadata:
+            # PBIX/PBIT-only mode: no screenshot, so there is no displayed value.
+            # The measure's DAX and its Power BI format string drive the SQL.
+            measures = [
+                (m.name, "", m.dax_expression or "",
+                 describe_format(m.format_string))
+                for m in metadata.all_measures if m.name
+            ]
+            if measures:
+                scenarios.append({
+                    "id": "S1", "label": "Model measures (no filters)",
+                    "view_name": "", "filters": [], "kpis": measures,
+                })
+        else:
+            # Attach format guidance to screenshot-derived KPIs too.
+            for sc in scenarios:
+                sc["kpis"] = [
+                    (k[0], k[1], k[2], fmt_by_name.get(k[0].casefold(), ""))
+                    for k in sc["kpis"]
+                ]
+        return scenarios
 
     # --- generation -------------------------------------------------------
     def generate(
@@ -77,8 +161,8 @@ class ValidationPlanService:
     ) -> ValidationPlan:
         settings = settings or (self._repo.load_llm_settings(project) or LLMSettings())
 
-        targets = self._collect_targets(project)
-        if not targets:
+        scenarios = self._build_scenarios(project)
+        if not scenarios:
             raise ValidationError(
                 "No KPIs or measures to map. Run AI vision extraction (Step 2) or "
                 "extract metadata (Step 1) first."
@@ -95,10 +179,10 @@ class ValidationPlanService:
         client = client or create_client(settings)
         response = client.complete(
             PLAN_SYSTEM_PROMPT.replace("{dialect}", dialect),
-            build_plan_user_prompt(targets, schema.compact_text(), dialect),
+            build_plan_user_prompt(scenarios, schema.compact_text(), dialect),
         )
 
-        items = self._parse(response.content, dict(targets))
+        items = self._parse(response.content, scenarios)
         plan = ValidationPlan(
             items=items,
             provider=settings.provider,
@@ -111,7 +195,7 @@ class ValidationPlanService:
 
     # --- parsing ----------------------------------------------------------
     @staticmethod
-    def _parse(content: str, target_values: dict[str, str]) -> list[ValidationPlanItem]:
+    def _parse(content: str, scenarios: list[dict]) -> list[ValidationPlanItem]:
         data = extract_json(content)
         if isinstance(data, dict):
             data = data.get("validation_plan", data.get("plan", data.get("items")))
@@ -120,14 +204,23 @@ class ValidationPlanService:
                 "The LLM did not return a JSON validation plan (array of items)."
             )
 
-        # Case-insensitive lookup of the displayed dashboard value per KPI.
-        value_lookup = {k.casefold(): v for k, v in target_values.items()}
+        # (scenario_id, kpi_name) -> displayed value, so each item is linked to
+        # the value shown in ITS scenario.
+        by_scenario = {sc["id"]: sc for sc in scenarios}
+        value_lookup: dict[tuple[str, str], str] = {}
+        for sc in scenarios:
+            for kpi in sc.get("kpis", []):
+                value_lookup[(sc["id"], kpi[0].casefold())] = kpi[1]
+        default_sid = scenarios[0]["id"] if scenarios else ""
+
         items: list[ValidationPlanItem] = []
         for raw in data:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("kpi_name", raw.get("kpi", ""))).strip()
             sql = str(raw.get("generated_sql", raw.get("sql", ""))).strip()
+            sid = str(raw.get("scenario", "")).strip() or default_sid
+            sc = by_scenario.get(sid, {})
             filters = raw.get("filters", []) or []
             try:
                 confidence = float(raw.get("confidence", 0.0) or 0.0)
@@ -135,7 +228,9 @@ class ValidationPlanService:
                 confidence = 0.0
             item = ValidationPlanItem(
                 kpi_name=name,
-                dashboard_value=value_lookup.get(name.casefold(), ""),
+                scenario=sc.get("label", ""),
+                view_name=sc.get("view_name", ""),
+                dashboard_value=value_lookup.get((sid, name.casefold()), ""),
                 table=str(raw.get("table", "")).strip(),
                 column=str(raw.get("column", "")).strip(),
                 aggregation=str(raw.get("aggregation", "")).strip(),

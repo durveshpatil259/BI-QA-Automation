@@ -139,40 +139,116 @@ def build_explain_user_prompt(failures) -> str:
 
 
 PLAN_SYSTEM_PROMPT = (
-    "You are a Business Intelligence data-validation architect. You are given a list "
-    "of dashboard KPIs (with their displayed values) and the datasource SCHEMA "
-    "(tables, columns, primary/foreign keys). For EACH KPI, map it to the datasource "
-    "and generate ONE read-only SQL query that computes the KPI's value from the "
-    "database.\n\n"
-    "Hard rules:\n"
-    "- Use ONLY tables/columns present in the provided schema. Never invent names.\n"
-    "- Each query MUST be a single read-only SELECT that returns ONE scalar value "
-    "(the metric). Do NOT use INSERT/UPDATE/DELETE/DDL, and no multiple statements.\n"
-    "- Target dialect: {dialect}. For percentages, compute the percentage number so "
-    "it is comparable to the displayed value.\n"
-    "- You do NOT execute SQL. Python will run it and compare the result.\n\n"
+    "You are a senior BI data-validation engineer. For EACH dashboard KPI you are "
+    "given, write ONE read-only SQL query that reproduces that KPI's number from the "
+    "source database, so it can be compared against the dashboard.\n\n"
+    "You are given: the KPI name and its displayed value, the DAX formula behind it "
+    "when available, the slicer values ACTIVE on the dashboard, and the database "
+    "schema with sample column values and join paths.\n\n"
+    "HARD RULES\n"
+    "1. Use ONLY tables/columns from the provided schema. Never invent a name.\n"
+    "2. JOIN whenever the measure and the filter live in different tables. Use the "
+    "listed JOIN PATHS (they are reliable even when no foreign key is declared).\n"
+    "3. Apply EVERY active dashboard filter as a WHERE clause. This is mandatory — a "
+    "KPI displayed under Fiscal Year = FY2020 MUST be filtered to FY2020, or the "
+    "comparison is meaningless.\n"
+    "4. Match literals to the sample values shown for that column (e.g. write "
+    "'FY2020', not 2020, if that is the real stored format).\n"
+    "5. Mirror the DAX when given: SUM->SUM, DISTINCTCOUNT->COUNT(DISTINCT ...), "
+    "AVERAGE->AVG, DIVIDE(a,b)->a*1.0/NULLIF(b,0).\n"
+    "6. FORMAT THE RESULT TO MATCH THE DASHBOARD EXACTLY. Look at the displayed "
+    "value and reproduce that exact string in SQL, so the query output can be "
+    "compared character-for-character. Apply the same scaling, rounding, currency "
+    "symbol and suffix:\n"
+    "     $51.88M  -> CONCAT('$', ROUND(SUM(x)/1000000.0, 2), 'M')\n"
+    "     11.2%    -> CONCAT(ROUND(100.0*SUM(a)/NULLIF(SUM(b),0), 1), '%')\n"
+    "     24K      -> CONCAT(ROUND(COUNT(DISTINCT x)/1000.0, 0), 'K')\n"
+    "     $2,206   -> CONCAT('$', FORMAT(ROUND(AVG(x), 0), 'N0'))\n"
+    "   Return exactly ONE column containing that formatted value.\n"
+    "   If no displayed value is given, use the FORMAT guidance instead — it is the "
+    "measure's Power BI format string, so following it reproduces exactly how the "
+    "dashboard renders that KPI.\n"
+    "   Measure DAX may reference OTHER measures in [Brackets] (e.g. "
+    "[Total Sales] - [Total Cost]). Expand those into their own SQL expressions.\n"
+    "7. A single read-only SELECT per KPI. No semicolons, no INSERT/UPDATE/DELETE/DDL. "
+    "You do NOT execute anything — Python runs it.\n"
+    "8. Target dialect: {dialect}. Bracket-quote identifiers containing spaces, e.g. "
+    "[Sales Amount], [Fiscal Year].\n\n"
+    "WORKED EXAMPLE\n"
+    "KPI 'Total Sales' displayed as $51.88M, DAX SUM(Sales[Sales Amount]), active "
+    "filter Fiscal Year = FY2020, join path Sales_data.OrderDateKey = "
+    "date_data.DateKey. Correct answer:\n"
+    "  SELECT CONCAT('$', ROUND(SUM(F.[Sales Amount])/1000000.0, 2), 'M') "
+    "FROM dbo.Sales_data F "
+    "JOIN dbo.date_data D ON F.OrderDateKey = D.DateKey "
+    "WHERE D.[Fiscal Year] = 'FY2020'\n"
+    "That returns exactly '$51.88M', matching the dashboard character-for-character.\n\n"
+    "You may be given SEVERAL SCENARIOS — the same dashboard captured under "
+    "different slicer selections (e.g. one screenshot per fiscal year). Produce a "
+    "SEPARATE plan item for EVERY (scenario, KPI) pair, each filtered to that "
+    "scenario's slicer values. Copy the scenario id onto each item.\n\n"
     "Respond with STRICT JSON (no markdown/fences): an object with key "
     '"validation_plan" whose value is an array of objects with keys:\n'
-    '  "kpi_name": string (must match one of the given KPI names)\n'
-    '  "table": string    (schema.table used)\n'
-    '  "column": string   (primary measured column)\n'
-    '  "aggregation": string (SUM/AVG/COUNT/DISTINCTCOUNT/…)\n'
-    '  "business_meaning": string\n'
-    '  "filters": [string] (WHERE conditions applied, if any)\n'
-    '  "generated_sql": string (the single read-only SELECT)\n'
-    '  "confidence": number between 0 and 1 (mapping confidence)\n'
+    '  "scenario": string (the scenario id you were given, e.g. "S1")\n'
+    '  "kpi_name": string (must match one of the given KPI names exactly)\n'
+    '  "table": string    (main fact table used)\n'
+    '  "column": string   (measured column)\n'
+    '  "aggregation": string (SUM/AVG/COUNT/COUNT DISTINCT/…)\n'
+    '  "business_meaning": string (what it measures, in one line)\n'
+    '  "filters": [string] (each WHERE condition you applied)\n'
+    '  "generated_sql": string (single read-only SELECT, formatted to match the '
+    "displayed value)\n"
+    '  "confidence": number 0-1 (your mapping confidence)\n'
 )
 
 
-def build_plan_user_prompt(kpis: list[tuple[str, str]], schema_text: str, dialect: str) -> str:
-    """kpis: list of (name, displayed_value). schema_text: DbSchema.compact_text()."""
-    lines = [f"DATASOURCE DIALECT: {dialect}", "", "KPIs TO MAP:"]
-    for name, value in kpis:
-        lines.append(f"  - {name}" + (f"  (displayed: {value})" if value else ""))
-    lines += ["", "DATASOURCE SCHEMA:", schema_text or "(no schema provided)", ""]
+def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
+    """Build the mapping prompt from one or more filter scenarios.
+
+    ``scenarios`` is a list of dicts::
+
+        {"id": "S1", "label": "Fiscal Year=FY2020",
+         "filters": [(name, selected), ...],
+         "kpis": [(name, displayed_value, dax), ...]}
+    """
+    lines = [f"DATASOURCE DIALECT: {dialect}", ""]
     lines.append(
-        "Produce the STRICT JSON validation_plan now — one item per KPI, each with a "
-        "single read-only SELECT that returns the KPI's scalar value."
+        f"SCENARIOS ({len(scenarios)}) — each is the same dashboard under different "
+        "slicer selections. Generate one plan item per (scenario, KPI)."
+    )
+    lines.append("")
+
+    for sc in scenarios:
+        lines.append(f"SCENARIO {sc['id']} — {sc['label']}")
+        lines.append("  Active filters (apply ALL in the WHERE clause):")
+        if sc.get("filters"):
+            for name, selected in sc["filters"]:
+                lines.append(f"    - {name} = {selected}")
+        else:
+            lines.append("    (none — query the full dataset)")
+        lines.append("  KPIs displayed in this scenario:")
+        for kpi in sc.get("kpis", []):
+            name, value = kpi[0], kpi[1]
+            dax = kpi[2] if len(kpi) > 2 else ""
+            fmt = kpi[3] if len(kpi) > 3 else ""
+            line = f"    - {name}"
+            if value:
+                line += f"  | displayed: {value}  (MATCH THIS FORMAT EXACTLY)"
+            if dax:
+                line += f"  | DAX: {dax}"
+            if fmt:
+                # Power BI format string — authoritative when no screenshot
+                # value exists, so the SQL still returns dashboard-shaped output.
+                line += f"  | FORMAT: {fmt}"
+            lines.append(line)
+        lines.append("")
+
+    lines += ["DATABASE SCHEMA:", schema_text or "(no schema provided)", ""]
+    lines.append(
+        "Produce the STRICT JSON validation_plan now — one item per (scenario, KPI). "
+        "JOIN to the tables holding the filter columns, apply that scenario's filters "
+        "in the WHERE clause, and format the output to match the displayed value "
+        "character-for-character."
     )
     return "\n".join(lines)
 
@@ -188,14 +264,18 @@ VISION_SYSTEM_PROMPT = (
     '  "charts": array of {"visual_type": string, "title": string, '
     '"fields": [string], "text": string}  — visual_type like bar_chart, line_chart, '
     "pie/donut, table, matrix, gauge, map, treemap, slicer, card\n"
-    '  "filters": [string]  — slicer/filter names or selected values\n'
+    '  "filters": array of {"name": string, "selected": string}  — EVERY slicer, '
+    'with its currently selected value. Use "All" when nothing is narrowed. This '
+    "is critical: a KPI shown under Fiscal Year = FY2020 is only valid for FY2020.\n"
     '  "visible_text": string  — other notable on-screen text/titles\n'
 )
 
 VISION_USER_PROMPT = (
     "Analyse the attached dashboard screenshot(s) and return the STRICT JSON object "
     "described in the system message. Capture every KPI card with its exact displayed "
-    "value, and every chart with its title and the fields/measures it appears to show."
+    "value, every chart with its title and the fields/measures it appears to show, and "
+    "every slicer at the top/side WITH the value currently selected in it (read the "
+    "text inside the slicer box, e.g. 'FY2020' or 'All')."
 )
 
 

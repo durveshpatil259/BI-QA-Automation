@@ -19,17 +19,18 @@ from src.ui import theme
 from src.ui.state import AppContext, get_active_project
 
 _GRID_COLUMNS = [
-    "Test ID", "KPI", "Dashboard Value", "Generated SQL", "Database Value",
-    "Difference", "Execution Time (ms)", "Status",
+    "Test ID", "Scenario", "KPI", "Dashboard Value", "Generated SQL",
+    "Database Value", "Difference", "Match", "Execution Time (ms)", "Status",
 ]
 
 
 def _grid(run: DataValidationRun) -> pd.DataFrame:
     return pd.DataFrame([{
-        "Test ID": r.test_id, "KPI": r.kpi_name,
+        "Test ID": r.test_id, "Scenario": r.scenario, "KPI": r.kpi_name,
         "Dashboard Value": r.dashboard_value, "Generated SQL": r.generated_sql,
         "Database Value": r.database_value, "Difference": r.difference,
-        "Execution Time (ms)": r.execution_time_ms, "Status": str(r.status),
+        "Match": r.match_type, "Execution Time (ms)": r.execution_time_ms,
+        "Status": str(r.status),
     } for r in run.results], columns=_GRID_COLUMNS)
 
 
@@ -39,7 +40,12 @@ def _status_badge(status: TestStatus) -> str:
 
 def _drilldown(ctx: AppContext, project, run: DataValidationRun) -> None:
     theme.section("Row details")
-    options = {f"{r.test_id} · {r.kpi_name} · {r.status}": r for r in run.results}
+    options = {
+        f"{r.test_id} · {r.kpi_name}"
+        + (f" · {r.scenario}" if r.scenario else "")
+        + f" · {r.status}": r
+        for r in run.results
+    }
     choice = st.selectbox("Select a test to inspect", list(options.keys()))
     r = options[choice]
 
