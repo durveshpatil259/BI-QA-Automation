@@ -487,6 +487,25 @@ class DetectedVisual(SerializableMixin):
     page: str = ""
     source: str = ""                 # "screenshot" | "metadata"
 
+    # --- multi-value chart/table/matrix support -----------------------
+    dimension_field: str = ""        # the category/axis being grouped, e.g. "Category"
+    measure_field: str = ""          # what's plotted, e.g. "Sales Amount"
+    data_points: list["ChartDataPoint"] = field(default_factory=list)
+    # True when exact per-category numbers were readable (data labels, table
+    # cells, tooltips); False when only shapes/proportions are visible
+    # (unlabeled bars, an unlabeled donut, a colour-shaded map) — in that case
+    # only the category SET can be validated, not the values.
+    values_visible: bool = False
+
+
+@dataclass
+class ChartDataPoint(SerializableMixin):
+    """One (category, value) pair read off a chart, table or matrix cell."""
+
+    dimension: str = ""               # e.g. "Accessories", "Southwest", "2020"
+    raw_value: str = ""               # as displayed; "" if not readable
+    numeric_value: float | None = None
+
 
 @dataclass
 class DashboardFilter(SerializableMixin):
@@ -573,6 +592,18 @@ class ValidationPlanItem(SerializableMixin):
     scenario: str = ""
     view_name: str = ""
 
+    # --- chart/table/matrix support ---------------------------------------
+    # "scalar"     — one KPI card, one number (the original behaviour).
+    # "grouped"    — a chart/table with a GROUP BY; generated_sql returns
+    #                (dimension, value) rows compared one-by-one.
+    # "structural" — chart shows categories but no readable numbers;
+    #                generated_sql returns DISTINCT dimension members only,
+    #                compared as a set against what the chart displays.
+    item_type: str = "scalar"
+    visual_title: str = ""           # e.g. "Sales by Category"; blank for KPIs
+    dimension_column: str = ""       # the GROUP BY / DISTINCT column used
+    expected_points: list["ChartDataPoint"] = field(default_factory=list)
+
 
 @dataclass
 class ValidationPlan(SerializableMixin):
@@ -609,6 +640,10 @@ class SqlValidationResult(SerializableMixin):
     reason: str = ""
     recommendation: str = ""
     confidence: float = 0.0
+    # Which chart this row belongs to, and which category within it — blank
+    # for a plain KPI card. "kpi_name" holds "Sales by Category" for these.
+    visual_title: str = ""
+    dimension_value: str = ""
     # "exact" when the database returned the dashboard's displayed string
     # verbatim; "numeric" when it matched only after numeric normalisation.
     match_type: str = ""

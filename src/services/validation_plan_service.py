@@ -76,6 +76,85 @@ class ValidationPlanService:
                     seen.add(m.name.casefold())
         return targets
 
+    # Visuals that carry no validatable dimension of their own.
+    _SKIP_VISUALS = {
+        "slicer", "card", "kpi_card", "image", "textbox", "shape",
+        "actionbutton", "multirowcard",
+    }
+
+    def _visuals_from_metadata(self, metadata) -> list[dict]:
+        """Build chart descriptors from the PBIX/PBIT report layout.
+
+        The report layout binds each visual to fields like
+        ``product_data.Category`` (a dimension) and ``Sales_data.Total Sales``
+        (a measure). That is enough to generate a GROUP BY query per chart even
+        when no screenshot exists — the values cannot be compared, but the
+        query's correctness and the category set still can.
+        """
+        if not metadata:
+            return []
+        measure_names = {m.name.casefold() for m in metadata.all_measures if m.name}
+
+        out: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for visual in metadata.all_visuals:
+            vtype = (visual.visual_type or "").strip()
+            if vtype.casefold() in self._SKIP_VISUALS or not visual.fields:
+                continue
+
+            dimension, measure = "", ""
+            for ref in visual.fields:
+                field = ref.rsplit(".", 1)[-1].strip()
+                if field.casefold() in measure_names:
+                    measure = measure or ref
+                elif not dimension:
+                    dimension = ref
+            # A visual with no dimension (e.g. a gauge on a single measure) is
+            # already covered by that measure's scalar KPI test.
+            if not dimension:
+                continue
+
+            key = (vtype.casefold(), dimension.casefold(), measure.casefold())
+            if key in seen:
+                continue          # same chart repeated across pages
+            seen.add(key)
+
+            out.append({
+                "title": visual.title or f"{vtype} by {dimension.rsplit('.', 1)[-1]}",
+                "visual_type": vtype,
+                "dimension_field": dimension,
+                "measure_field": measure,
+                "values_visible": False,   # no screenshot -> no readable numbers
+                "categories": [],
+                "points": [],
+                "page": visual.page,
+            })
+        return out
+
+    def _describe_visuals(self, visuals) -> list[dict]:
+        """Summarise charts/tables for the AI prompt, skipping non-data visuals."""
+        out: list[dict] = []
+        for v in visuals or []:
+            vtype = (v.visual_type or "").strip().casefold()
+            if vtype in self._SKIP_VISUALS:
+                continue
+            # Need something to group by, otherwise there is nothing to compare.
+            dimension = v.dimension_field or ""
+            categories = [p.dimension for p in v.data_points if p.dimension]
+            if not dimension and not categories:
+                continue
+            out.append({
+                "title": v.title or v.visual_type or "visual",
+                "visual_type": v.visual_type,
+                "dimension_field": dimension,
+                "measure_field": v.measure_field,
+                "values_visible": bool(v.values_visible),
+                "categories": categories,
+                # Kept out of the prompt text; used by the engine to compare.
+                "points": list(v.data_points),
+            })
+        return out
+
     def _build_scenarios(self, project: Project) -> list[dict]:
         """One scenario per screenshot view (each has its own slicer selection).
 
@@ -104,7 +183,8 @@ class ValidationPlanService:
                     (k.name, k.raw_value, dax_by_name.get(k.name.casefold(), ""))
                     for k in view.kpis if k.name
                 ]
-                if not kpis:
+                visuals = self._describe_visuals(view.visuals)
+                if not kpis and not visuals:
                     continue
                 scenarios.append({
                     "id": f"S{i}",
@@ -112,6 +192,7 @@ class ValidationPlanService:
                     "view_name": view.name,
                     "filters": [(f.name, f.selected) for f in view.active_filters()],
                     "kpis": kpis,
+                    "visuals": visuals,
                 })
 
         if not scenarios and extraction and extraction.kpis:
@@ -137,18 +218,30 @@ class ValidationPlanService:
                  describe_format(m.format_string))
                 for m in metadata.all_measures if m.name
             ]
-            if measures:
+            # Charts come from the report layout's field bindings, so every
+            # visual is validated even with no screenshot uploaded.
+            layout_visuals = self._visuals_from_metadata(metadata)
+            if measures or layout_visuals:
                 scenarios.append({
                     "id": "S1", "label": "Model measures (no filters)",
                     "view_name": "", "filters": [], "kpis": measures,
+                    "visuals": layout_visuals,
                 })
         else:
             # Attach format guidance to screenshot-derived KPIs too.
+            layout_visuals = self._visuals_from_metadata(metadata)
             for sc in scenarios:
                 sc["kpis"] = [
                     (k[0], k[1], k[2], fmt_by_name.get(k[0].casefold(), ""))
                     for k in sc["kpis"]
                 ]
+                # Add layout-only charts the screenshot did not capture (e.g.
+                # visuals on other pages), matching on title.
+                have = {str(v.get("title", "")).casefold() for v in sc.get("visuals", [])}
+                sc.setdefault("visuals", []).extend(
+                    v for v in layout_visuals
+                    if str(v.get("title", "")).casefold() not in have
+                )
         return scenarios
 
     # --- generation -------------------------------------------------------
@@ -208,9 +301,13 @@ class ValidationPlanService:
         # the value shown in ITS scenario.
         by_scenario = {sc["id"]: sc for sc in scenarios}
         value_lookup: dict[tuple[str, str], str] = {}
+        visual_points: dict[tuple[str, str], list] = {}
         for sc in scenarios:
             for kpi in sc.get("kpis", []):
                 value_lookup[(sc["id"], kpi[0].casefold())] = kpi[1]
+            for vis in sc.get("visuals", []):
+                visual_points[(sc["id"], str(vis.get("title", "")).casefold())] = \
+                    vis.get("points", [])
         default_sid = scenarios[0]["id"] if scenarios else ""
 
         items: list[ValidationPlanItem] = []
@@ -226,6 +323,9 @@ class ValidationPlanService:
                 confidence = float(raw.get("confidence", 0.0) or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
+            item_type = str(raw.get("item_type", "scalar")).strip().lower()
+            if item_type not in ("scalar", "grouped", "structural"):
+                item_type = "scalar"
             item = ValidationPlanItem(
                 kpi_name=name,
                 scenario=sc.get("label", ""),
@@ -238,7 +338,14 @@ class ValidationPlanService:
                 filters=[str(f).strip() for f in filters if str(f).strip()],
                 generated_sql=sql,
                 confidence=confidence,
+                item_type=item_type,
+                dimension_column=str(raw.get("dimension_column", "")).strip(),
             )
+            # For chart items, attach what the dashboard actually showed so the
+            # engine can compare per-category (or as a category set).
+            if item_type in ("grouped", "structural"):
+                item.visual_title = name
+                item.expected_points = visual_points.get((sid, name.casefold()), [])
             # Flag non-read-only SQL so execution (V5) can skip it safely.
             if sql and not is_read_only(sql):
                 item.business_meaning = (

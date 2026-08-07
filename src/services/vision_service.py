@@ -16,6 +16,7 @@ from src.core.constants import SCREENSHOT_EXTENSIONS
 from src.core.exceptions import LLMResponseError, ValidationError
 from src.core.logger import get_logger
 from src.domain.models import (
+    ChartDataPoint,
     DashboardExtraction,
     DashboardFilter,
     DashboardKPI,
@@ -159,11 +160,27 @@ class VisionService:
             if not isinstance(c, dict):
                 continue
             fields = c.get("fields", []) or []
+            values_visible = bool(c.get("values_visible", False))
+            points: list[ChartDataPoint] = []
+            for dp in c.get("data_points", []) or []:
+                if not isinstance(dp, dict):
+                    continue
+                dim = str(dp.get("dimension", dp.get("category", ""))).strip()
+                if not dim:
+                    continue
+                raw = str(dp.get("value", "")).strip()
+                numeric, _ = parse_value(raw) if raw else (None, "")
+                points.append(ChartDataPoint(dimension=dim, raw_value=raw, numeric_value=numeric))
+
             extraction.visuals.append(DetectedVisual(
                 visual_type=str(c.get("visual_type", c.get("type", ""))).strip(),
                 title=str(c.get("title", c.get("chart_title", ""))).strip(),
                 fields=[str(f) for f in fields if str(f).strip()],
                 text=str(c.get("text", "")).strip(),
+                dimension_field=str(c.get("dimension_field", "")).strip(),
+                measure_field=str(c.get("measure_field", "")).strip(),
+                values_visible=values_visible,
+                data_points=points,
                 source="screenshot",
             ))
 

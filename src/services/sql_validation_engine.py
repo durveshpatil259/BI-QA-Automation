@@ -60,9 +60,18 @@ class SqlValidationEngine:
 
         run = DataValidationRun()
         for i, item in enumerate(plan.items, start=1):
-            run.results.append(
-                self._validate_item(f"QA_{i:03d}", item, connector, tolerance_pct, excel)
-            )
+            if item.item_type == "grouped":
+                run.results.extend(
+                    self._validate_grouped(f"CH_{i:03d}", item, connector, tolerance_pct, excel)
+                )
+            elif item.item_type == "structural":
+                run.results.append(
+                    self._validate_structural(f"ST_{i:03d}", item, connector, excel)
+                )
+            else:
+                run.results.append(
+                    self._validate_item(f"QA_{i:03d}", item, connector, tolerance_pct, excel)
+                )
 
         # DAX-driven checks: when there is no screenshot value, a measure defined
         # from other measures can still be verified arithmetically.
@@ -148,6 +157,185 @@ class SqlValidationEngine:
         result.match_type = outcome.match_type
         result.status = TestStatus.PASS if outcome.passed else TestStatus.FAIL
         result.reason = outcome.reason
+        return result
+
+    # --- chart / table / matrix validation --------------------------------
+    def _run_multirow(self, item: ValidationPlanItem, connector, excel, max_rows=500):
+        """Execute a chart query, returning (rows, elapsed_ms, error)."""
+        if excel:
+            return None, None, "SQL execution is not supported for an Excel datasource."
+        if not item.generated_sql or not is_read_only(item.generated_sql):
+            return None, None, "Generated SQL is missing or not a single read-only SELECT."
+        t0 = time.perf_counter()
+        qr = connector.run_query(item.generated_sql, sample_rows=max_rows)
+        elapsed = round((time.perf_counter() - t0) * 1000, 2)
+        if qr.error:
+            return None, elapsed, f"SQL execution error: {qr.error}"
+        return qr.sample_rows or [], elapsed, None
+
+    def _validate_grouped(
+        self, base_id, item: ValidationPlanItem, connector, tolerance_pct, excel
+    ) -> list[SqlValidationResult]:
+        """Compare each category's displayed value against its database value.
+
+        The query returns (dimension, value) rows; each dashboard data point
+        becomes its own PASS/FAIL row so a single wrong bar is pinpointed.
+        """
+        rows, elapsed, error = self._run_multirow(item, connector, excel)
+        if error:
+            return [SqlValidationResult(
+                test_id=base_id, kpi_name=item.visual_title or item.kpi_name,
+                visual_title=item.visual_title, scenario=item.scenario,
+                generated_sql=item.generated_sql, execution_time_ms=elapsed,
+                execution_status="error", status=TestStatus.FAIL, reason=error,
+                confidence=item.confidence, match_type="chart-grouped",
+            )]
+
+        # dimension -> displayed value from the database
+        db_by_dim = {
+            str(r[0]).strip().casefold(): str(r[1])
+            for r in rows if r and len(r) >= 2
+        }
+
+        # No screenshot data points (PBIX/PBIT-only mode): the chart's values
+        # were never rendered, so validate that its field bindings produce a
+        # real, non-empty grouped result set.
+        if not item.expected_points:
+            sample = ", ".join(
+                f"{r[0]}={r[1]}" for r in rows[:5] if r and len(r) >= 2
+            )
+            ok = bool(db_by_dim)
+            return [SqlValidationResult(
+                test_id=base_id,
+                kpi_name=item.visual_title or item.kpi_name,
+                visual_title=item.visual_title, scenario=item.scenario,
+                generated_sql=item.generated_sql, execution_time_ms=elapsed,
+                execution_status="ok",
+                status=TestStatus.PASS if ok else TestStatus.FAIL,
+                match_type="chart-executability", confidence=item.confidence,
+                database_value=f"{len(db_by_dim)} categories",
+                reason=(
+                    f"Chart query executed and returned {len(db_by_dim)} grouped "
+                    f"row(s): {sample}. No screenshot was supplied, so this validates "
+                    "the visual's field bindings and query, not the plotted values."
+                ) if ok else (
+                    "Chart query executed but returned no rows — the visual's field "
+                    "bindings or filters are likely wrong."
+                ),
+            )]
+
+        results: list[SqlValidationResult] = []
+        for n, point in enumerate(item.expected_points, start=1):
+            key = point.dimension.strip().casefold()
+            db_value = db_by_dim.get(key)
+            res = SqlValidationResult(
+                test_id=f"{base_id}_{n:02d}",
+                kpi_name=f"{item.visual_title or item.kpi_name} · {point.dimension}",
+                visual_title=item.visual_title, dimension_value=point.dimension,
+                scenario=item.scenario, dashboard_value=point.raw_value,
+                dashboard_numeric=point.numeric_value,
+                generated_sql=item.generated_sql, execution_time_ms=elapsed,
+                execution_status="ok", tolerance_pct=tolerance_pct,
+                confidence=item.confidence, match_type="chart-grouped",
+            )
+            if db_value is None:
+                res.status = TestStatus.FAIL
+                res.reason = (
+                    f"Category '{point.dimension}' is shown on the chart but the "
+                    "database query returned no such row."
+                )
+                results.append(res)
+                continue
+
+            res.database_value = db_value
+            res.database_numeric, _ = parse_value(db_value)
+            if not point.raw_value:
+                # Category matched but no readable number on the chart.
+                res.status = TestStatus.PASS
+                res.match_type = "chart-category"
+                res.reason = (
+                    f"Category '{point.dimension}' exists in the database "
+                    f"(value {db_value}); the chart showed no readable number to compare."
+                )
+            else:
+                outcome = compare_display_values(
+                    point.raw_value, db_value, tolerance_pct=tolerance_pct
+                )
+                res.difference = outcome.difference_display
+                res.difference_pct = outcome.difference_pct
+                res.match_type = outcome.match_type or "chart-grouped"
+                res.status = TestStatus.PASS if outcome.passed else TestStatus.FAIL
+                res.reason = outcome.reason
+            results.append(res)
+
+        # Categories present in the database but missing from the chart.
+        shown = {p.dimension.strip().casefold() for p in item.expected_points}
+        missing = [d for d in db_by_dim if d not in shown]
+        if missing:
+            results.append(SqlValidationResult(
+                test_id=f"{base_id}_COV",
+                kpi_name=f"{item.visual_title or item.kpi_name} · coverage",
+                visual_title=item.visual_title, scenario=item.scenario,
+                generated_sql=item.generated_sql, execution_time_ms=elapsed,
+                execution_status="ok", status=TestStatus.FAIL,
+                match_type="chart-coverage", confidence=item.confidence,
+                dashboard_value=f"{len(shown)} categories shown",
+                database_value=f"{len(db_by_dim)} categories in database",
+                reason=(
+                    "Database has categories not displayed on the chart: "
+                    + ", ".join(sorted(missing)[:10])
+                    + ". This may be correct (Top-N visual) or a missing-data defect."
+                ),
+            ))
+        return results
+
+    def _validate_structural(
+        self, test_id, item: ValidationPlanItem, connector, excel
+    ) -> SqlValidationResult:
+        """Compare the chart's category SET against the database.
+
+        Used when the chart shows shapes/colours but no readable numbers, so the
+        values cannot be checked — but the categories still can.
+        """
+        result = SqlValidationResult(
+            test_id=test_id, kpi_name=item.visual_title or item.kpi_name,
+            visual_title=item.visual_title, scenario=item.scenario,
+            generated_sql=item.generated_sql, confidence=item.confidence,
+            match_type="chart-structural",
+        )
+        rows, elapsed, error = self._run_multirow(item, connector, excel)
+        result.execution_time_ms = elapsed
+        if error:
+            result.execution_status = "error"
+            result.status = TestStatus.FAIL
+            result.reason = error
+            return result
+
+        db_cats = {str(r[0]).strip().casefold() for r in rows if r}
+        shown = {p.dimension.strip().casefold() for p in item.expected_points}
+        result.execution_status = "ok"
+        result.dashboard_value = f"{len(shown)} categories shown"
+        result.database_value = f"{len(db_cats)} categories in database"
+
+        invalid = sorted(shown - db_cats)
+        if invalid:
+            result.status = TestStatus.FAIL
+            result.reason = (
+                "Chart displays categories that do not exist in the database: "
+                + ", ".join(invalid[:10])
+                + ". Values could not be compared (chart shows no printed numbers)."
+            )
+            return result
+
+        missing = sorted(db_cats - shown)
+        result.status = TestStatus.PASS
+        result.reason = (
+            f"All {len(shown)} displayed categories exist in the database. "
+            + (f"Database also has {len(missing)} not shown ("
+               + ", ".join(missing[:6]) + ") — expected for a Top-N or filtered visual. "
+               if missing else "")
+            + "Values were not compared because the chart shows no printed numbers."
+        )
         return result
 
     # --- DAX cross-measure consistency (screenshot-free verdicts) --------

@@ -187,17 +187,44 @@ PLAN_SYSTEM_PROMPT = (
     "different slicer selections (e.g. one screenshot per fiscal year). Produce a "
     "SEPARATE plan item for EVERY (scenario, KPI) pair, each filtered to that "
     "scenario's slicer values. Copy the scenario id onto each item.\n\n"
+    "=== CHARTS, TABLES, MATRICES, GAUGES, MAPS ===\n"
+    "You are ALSO given a list of VISUALS (not just KPI cards) — bar/line/donut/pie "
+    "charts, tables, matrices, gauges, maps. Each has a dimension_field (its "
+    "category/axis) and measure_field (what it plots), and is tagged "
+    "values_visible=true or false:\n\n"
+    "CASE A — values_visible=true (the chart showed data labels, or it is a "
+    "table/matrix/gauge): generate item_type='grouped'. Write ONE SQL query that "
+    "GROUPs BY the dimension column and aggregates the measure column, returning "
+    "one row per category — e.g. for 'Sales by Category' (dimension=Category, "
+    "measure=Sales Amount):\n"
+    "  SELECT P.Category, SUM(F.[Sales Amount]) FROM dbo.Sales_data F "
+    "JOIN dbo.product_data P ON F.ProductKey = P.ProductKey "
+    "GROUP BY P.Category\n"
+    "Format the aggregated column to match the data labels shown, same as for KPIs. "
+    "Set dimension_column to the GROUP BY column's schema name.\n\n"
+    "CASE B — values_visible=false (only shapes/colours, no printed numbers): "
+    "generate item_type='structural'. Write a SELECT DISTINCT on the dimension "
+    "column only — no aggregation, no numbers — e.g.:\n"
+    "  SELECT DISTINCT Region FROM dbo.Sales_Territory_data\n"
+    "This validates that the categories shown on the chart actually exist in the "
+    "data (and none are missing), even though the exact plotted values cannot be "
+    "read from a screenshot. Set dimension_column to that DISTINCT column.\n\n"
+    "Skip a visual only if it has no usable dimension_field (e.g. a slicer, or a "
+    "purely decorative image).\n\n"
     "Respond with STRICT JSON (no markdown/fences): an object with key "
     '"validation_plan" whose value is an array of objects with keys:\n'
     '  "scenario": string (the scenario id you were given, e.g. "S1")\n'
-    '  "kpi_name": string (must match one of the given KPI names exactly)\n'
+    '  "item_type": "scalar" | "grouped" | "structural"\n'
+    '  "kpi_name": string (KPI name for scalar; the CHART TITLE for grouped/structural)\n'
     '  "table": string    (main fact table used)\n'
-    '  "column": string   (measured column)\n'
-    '  "aggregation": string (SUM/AVG/COUNT/COUNT DISTINCT/…)\n'
+    '  "column": string   (measured column; blank for structural)\n'
+    '  "dimension_column": string (GROUP BY / DISTINCT column; blank for scalar)\n'
+    '  "aggregation": string (SUM/AVG/COUNT/COUNT DISTINCT/…; blank for structural)\n'
     '  "business_meaning": string (what it measures, in one line)\n'
     '  "filters": [string] (each WHERE condition you applied)\n'
-    '  "generated_sql": string (single read-only SELECT, formatted to match the '
-    "displayed value)\n"
+    '  "generated_sql": string (single read-only SELECT; scalar formats to match the '
+    "displayed value, grouped returns (dimension, value) rows, structural returns "
+    "distinct dimension values only)\n"
     '  "confidence": number 0-1 (your mapping confidence)\n'
 )
 
@@ -209,12 +236,15 @@ def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
 
         {"id": "S1", "label": "Fiscal Year=FY2020",
          "filters": [(name, selected), ...],
-         "kpis": [(name, displayed_value, dax), ...]}
+         "kpis": [(name, displayed_value, dax), ...],
+         "visuals": [{"title", "visual_type", "dimension_field", "measure_field",
+                      "values_visible", "categories": [name, ...]}, ...]}
     """
     lines = [f"DATASOURCE DIALECT: {dialect}", ""]
     lines.append(
         f"SCENARIOS ({len(scenarios)}) — each is the same dashboard under different "
-        "slicer selections. Generate one plan item per (scenario, KPI)."
+        "slicer selections. Generate one plan item per (scenario, KPI) AND per "
+        "(scenario, visual)."
     )
     lines.append("")
 
@@ -226,6 +256,7 @@ def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
                 lines.append(f"    - {name} = {selected}")
         else:
             lines.append("    (none — query the full dataset)")
+
         lines.append("  KPIs displayed in this scenario:")
         for kpi in sc.get("kpis", []):
             name, value = kpi[0], kpi[1]
@@ -241,14 +272,31 @@ def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
                 # value exists, so the SQL still returns dashboard-shaped output.
                 line += f"  | FORMAT: {fmt}"
             lines.append(line)
+
+        visuals = sc.get("visuals", [])
+        if visuals:
+            lines.append("  Charts/tables/matrices displayed in this scenario:")
+            for v in visuals:
+                mode = "VALUES VISIBLE -> item_type=grouped" if v.get("values_visible") \
+                    else "no numbers visible -> item_type=structural"
+                lines.append(
+                    f"    - '{v.get('title', '')}' ({v.get('visual_type', '')}) | "
+                    f"dimension_field={v.get('dimension_field', '?')} | "
+                    f"measure_field={v.get('measure_field', '?')} | {mode}"
+                )
+                cats = v.get("categories", [])
+                if cats:
+                    lines.append(f"      categories shown: {', '.join(cats[:20])}")
         lines.append("")
 
     lines += ["DATABASE SCHEMA:", schema_text or "(no schema provided)", ""]
     lines.append(
-        "Produce the STRICT JSON validation_plan now — one item per (scenario, KPI). "
-        "JOIN to the tables holding the filter columns, apply that scenario's filters "
-        "in the WHERE clause, and format the output to match the displayed value "
-        "character-for-character."
+        "Produce the STRICT JSON validation_plan now — one item per (scenario, KPI) "
+        "AND one item per (scenario, chart/table/matrix). JOIN to the tables holding "
+        "the filter and dimension columns, apply that scenario's filters in the WHERE "
+        "clause, format scalar output to match the displayed value "
+        "character-for-character, use GROUP BY for grouped items, and SELECT DISTINCT "
+        "for structural items."
     )
     return "\n".join(lines)
 
@@ -259,11 +307,28 @@ VISION_SYSTEM_PROMPT = (
     "into STRICT JSON — no markdown, no prose, no code fences.\n\n"
     "Read values EXACTLY as displayed (keep suffixes and symbols, e.g. '109.81M', "
     "'11.4%', '$1,234'). Do not compute or invent values; only report what you see.\n\n"
+    "For EVERY chart, table, matrix, gauge, map or donut — not just KPI cards — you "
+    "MUST determine whether exact per-category numbers are readable:\n"
+    "- If the chart has DATA LABELS printed on it, or it is a TABLE/MATRIX (whose "
+    "cells always show exact values), or a GAUGE (whose needle value is printed): "
+    "set values_visible=true and list every row/category with its exact value in "
+    "data_points.\n"
+    "- If the chart shows ONLY bar length, line shape, slice size or map colour "
+    "with NO printed numbers (a common default in Power BI): set "
+    "values_visible=false, and list data_points with dimension names ONLY (leave "
+    "value blank) — e.g. for an unlabeled bar chart of regions, still list every "
+    "region name shown on the axis, just without a value.\n"
+    "Also identify, for each chart: dimension_field (the category/axis being "
+    "grouped, e.g. 'Region', 'Category', 'Year') and measure_field (what is being "
+    "measured, e.g. 'Sales Amount').\n\n"
     "Return an object with these keys:\n"
-    '  "kpis": array of {"name": string, "value": string}  — KPI/card metrics\n'
-    '  "charts": array of {"visual_type": string, "title": string, '
-    '"fields": [string], "text": string}  — visual_type like bar_chart, line_chart, '
-    "pie/donut, table, matrix, gauge, map, treemap, slicer, card\n"
+    '  "kpis": array of {"name": string, "value": string}  — single-number KPI cards\n'
+    '  "charts": array of objects, one per chart/table/matrix/gauge/map/donut:\n'
+    '    {"visual_type": string, "title": string, "fields": [string], "text": string, '
+    '"dimension_field": string, "measure_field": string, "values_visible": boolean, '
+    '"data_points": [{"dimension": string, "value": string}]}\n'
+    "    visual_type is one of: bar_chart, line_chart, donut, pie, table, matrix, "
+    "gauge, map, treemap, card, slicer\n"
     '  "filters": array of {"name": string, "selected": string}  — EVERY slicer, '
     'with its currently selected value. Use "All" when nothing is narrowed. This '
     "is critical: a KPI shown under Fiscal Year = FY2020 is only valid for FY2020.\n"
@@ -272,10 +337,16 @@ VISION_SYSTEM_PROMPT = (
 
 VISION_USER_PROMPT = (
     "Analyse the attached dashboard screenshot(s) and return the STRICT JSON object "
-    "described in the system message. Capture every KPI card with its exact displayed "
-    "value, every chart with its title and the fields/measures it appears to show, and "
-    "every slicer at the top/side WITH the value currently selected in it (read the "
-    "text inside the slicer box, e.g. 'FY2020' or 'All')."
+    "described in the system message. Capture:\n"
+    "1. Every KPI card with its exact displayed value.\n"
+    "2. Every OTHER visual (bar/line/donut/pie/table/matrix/gauge/map/treemap) with "
+    "its title, dimension_field, measure_field, and its full list of data_points — "
+    "with real values when data labels/cells/needle are visible (values_visible=true), "
+    "or category names only when the chart shows shape/colour but no printed numbers "
+    "(values_visible=false). Do NOT skip a chart just because it has no visible "
+    "numbers — still list its categories with values_visible=false.\n"
+    "3. Every slicer WITH the value currently selected in it (read the text inside "
+    "the slicer box, e.g. 'FY2020' or 'All')."
 )
 
 
