@@ -13,8 +13,13 @@ pyodbc==5.2.0
 SQLAlchemy==2.0.36
 
 # Power BI parsing
-# PBIX = ZIP container; PBIP/PBIR/TMDL = plain text/JSON — handled with stdlib.
-# (No extra heavy deps required for MVP metadata extraction.)
+# PBIP/PBIR/TMDL and the report layout are plain text/JSON — handled with stdlib.
+# pbixray additionally decompresses the *binary* VertiPaq data model inside a
+# native .pbix, giving tables, DAX measures, relationships AND the row data —
+# in pure Python, with no .NET, no pbi-tools and no Power BI Desktop.
+# NOTE: the PyPI package literally named "pbi-tools" is an UNRELATED project
+# (a Power BI REST API wrapper). Do not add it here.
+pbixray==0.15.4
 
 # Screenshot / visual processing
 Pillow==10.4.0
@@ -30,3 +35,14 @@ pydantic==2.9.2
 
 # Reports
 Jinja2==3.1.4
+openpyxl  # (already required above for Excel) — also used for .xlsx report export
+# PDF export. xhtml2pdf is pure Python and works everywhere, so it is the
+# default. WeasyPrint gives better CSS fidelity but additionally needs the GTK3
+# native runtime on Windows (pip alone is not enough), so it stays optional.
+xhtml2pdf==0.2.17
+# weasyprint==63.1
+
+# API layer
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20   # required by FastAPI for file uploads

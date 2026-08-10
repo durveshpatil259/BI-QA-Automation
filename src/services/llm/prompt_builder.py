@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from src.domain.models import AnalysisContext
 
-_MAX_DAX = 200
-_MAX_FINDINGS = 60
-_MAX_TABLES = 40
-_MAX_TEXT = 400
+# Every section is bounded. The reasoning prompt writes a narrative summary —
+# it needs the SHAPE of the model and the FAILURES, not an exhaustive dump.
+# Small hosted models have tight per-minute budgets (llama-3.1-8b-instant is
+# 6,000 TPM), and max_tokens is charged against that budget too.
+_MAX_DAX = 90
+_MAX_FINDINGS = 20
+_MAX_TABLES = 15
+_MAX_MEASURES = 15
+_MAX_COMPARISONS = 15
+_MAX_FACTS = 10
+_MAX_TEXT = 200
 
 SYSTEM_PROMPT = (
     "You are a senior Business Intelligence QA analyst. You are given the results "
@@ -55,8 +62,10 @@ def _metadata_section(ctx: AnalysisContext) -> list[str]:
     measures = md.all_measures
     if measures:
         lines.append("Measures (name = DAX):")
-        for m in measures[:_MAX_TABLES]:
+        for m in measures[:_MAX_MEASURES]:
             lines.append(f"  - {m.table}[{m.name}] = {_clip(m.dax_expression, _MAX_DAX)}")
+        if len(measures) > _MAX_MEASURES:
+            lines.append(f"  … and {len(measures) - _MAX_MEASURES} more measures")
     return lines
 
 
@@ -84,18 +93,34 @@ def _validation_section(ctx: AnalysisContext) -> list[str]:
 def _comparison_section(ctx: AnalysisContext) -> list[str]:
     if not ctx.comparisons:
         return ["DATASOURCE COMPARISON: none (no datasource configured)."]
-    lines = [f"DATASOURCE COMPARISON ({ctx.datasource_type}):"]
-    for c in ctx.comparisons:
+
+    # Mismatches first — a summary is written from what went wrong, and a long
+    # tail of "MATCH" rows is the least useful thing to spend tokens on.
+    ordered = sorted(ctx.comparisons, key=lambda c: c.matched)
+    shown = ordered[:_MAX_COMPARISONS]
+    matched = sum(1 for c in ctx.comparisons if c.matched)
+
+    lines = [
+        f"DATASOURCE COMPARISON ({ctx.datasource_type}): "
+        f"{len(ctx.comparisons)} checks, {matched} matched, "
+        f"{len(ctx.comparisons) - matched} mismatched."
+    ]
+    for c in shown:
         mark = "MATCH" if c.matched else "MISMATCH"
-        detail = f" — {c.difference}" if c.difference else ""
+        detail = f" — {_clip(c.difference, 120)}" if c.difference else ""
         lines.append(
             f"  - [{mark}|{c.severity}] {c.label}: dashboard='{c.dashboard_value}' "
             f"vs datasource='{c.datasource_value}'{detail}"
         )
+    if len(ctx.comparisons) > len(shown):
+        lines.append(f"  … and {len(ctx.comparisons) - len(shown)} more checks")
+
     if ctx.data_results:
         lines.append("Datasource facts:")
-        for d in ctx.data_results:
+        for d in ctx.data_results[:_MAX_FACTS]:
             lines.append(f"  - {d.label} = {d.scalar_value}")
+        if len(ctx.data_results) > _MAX_FACTS:
+            lines.append(f"  … and {len(ctx.data_results) - _MAX_FACTS} more")
     return lines
 
 

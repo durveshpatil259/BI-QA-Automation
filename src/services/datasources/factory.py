@@ -12,12 +12,14 @@ from src.core.constants import DatasourceType
 from src.core.exceptions import DatasourceConfigError
 from src.domain.models import DatasourceConfig
 from src.services.datasources.base import DatasourceConnector
+from src.services.datasources.csv import CsvConnector
 from src.services.datasources.excel import ExcelConnector
 from src.services.datasources.sql_server import SqlServerConnector
 
 _REGISTRY: dict[DatasourceType, type[DatasourceConnector]] = {
     DatasourceType.SQL_SERVER: SqlServerConnector,
     DatasourceType.EXCEL: ExcelConnector,
+    DatasourceType.CSV: CsvConnector,
 }
 
 

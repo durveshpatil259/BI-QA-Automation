@@ -13,6 +13,7 @@ import re
 
 from src.core.exceptions import LLMError, LLMResponseError
 from src.core.logger import get_logger
+from src.core.constants import LLMProvider
 from src.domain.models import AIReasoning, AnalysisContext, LLMSettings, Project
 from src.services.llm import create_client
 from src.services.llm.base import LLMClient
@@ -31,7 +32,57 @@ class LLMService:
         self._repo = repository
 
     def load_settings(self, project: Project) -> LLMSettings:
-        return self._repo.load_llm_settings(project) or LLMSettings()
+        """Project settings if configured, otherwise the machine-level default.
+
+        The API creates a project per run, so requiring per-project LLM setup
+        would mean re-entering the key every time. Global defaults are
+        inherited; an explicit per-project override still wins.
+        """
+        saved = self._repo.load_llm_settings(project)
+        if saved and saved.is_configured:
+            return saved
+        return self.load_global_settings()
+
+    # --- machine-level defaults ------------------------------------------
+    @staticmethod
+    def load_global_settings() -> LLMSettings:
+        from src.core.config import load_config
+
+        config = load_config()
+        provider = LLMProvider.from_value(config.default_llm_provider)
+        api_key = (config.default_api_keys or {}).get(provider.value, "")
+        return LLMSettings(
+            provider=provider,
+            api_key=api_key,
+            model=config.default_llm_model,
+            base_url=config.default_llm_base_url,
+            temperature=config.default_llm_temperature,
+            max_tokens=config.default_llm_max_tokens,
+            is_configured=bool(api_key.strip()),
+        )
+
+    @staticmethod
+    def save_global_settings(settings: LLMSettings) -> LLMSettings:
+        from src.core.config import load_config, save_config
+
+        config = load_config()
+        config.default_llm_provider = settings.provider.value
+        config.default_llm_model = settings.model.strip()
+        config.default_llm_base_url = settings.base_url.strip()
+        config.default_llm_temperature = float(settings.temperature)
+        config.default_llm_max_tokens = int(settings.max_tokens)
+
+        keys = dict(config.default_api_keys or {})
+        if settings.api_key.strip():
+            keys[settings.provider.value] = settings.api_key.strip()
+        else:
+            keys.pop(settings.provider.value, None)
+        config.default_api_keys = keys
+
+        save_config(config)
+        settings.is_configured = bool(settings.api_key.strip())
+        _logger.info("Saved global LLM settings (provider=%s)", settings.provider)
+        return settings
 
     def save_settings(self, project: Project, settings: LLMSettings) -> LLMSettings:
         settings.is_configured = bool(settings.api_key.strip())

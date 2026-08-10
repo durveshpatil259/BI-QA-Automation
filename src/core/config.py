@@ -39,6 +39,27 @@ class AppConfig:
     projects_root: str = str(DEFAULT_PROJECTS_DIR)
     default_llm_provider: str = LLMProvider.GROK.value
     theme: str = "light"
+
+    # Machine-level LLM defaults. A project inherits these unless it has its
+    # own saved settings — which is what lets the SPA configure the LLM once
+    # instead of per generated project.
+    default_llm_model: str = ""
+    default_llm_base_url: str = ""
+    default_llm_temperature: float = 0.2
+    default_llm_max_tokens: int = 2048
+
+    # SECURITY: when False (the default) the LLM receives table and column
+    # NAMES only — never column contents. Sample values improve literal
+    # accuracy but are real production data leaving your network, so enabling
+    # this is an explicit, informed choice.
+    send_sample_values_to_llm: bool = False
+
+    # Workload size. Defaults suit a hosted model; lower both when running a
+    # local LLM on CPU, where every generated token costs real seconds.
+    #   max_scenarios      - filter combinations validated (1 = no slicer split)
+    #   max_items_per_call - queries requested per LLM round-trip
+    max_scenarios: int = 10
+    max_items_per_call: int = 10
     # Optional machine-level default API keys per provider. Per-project
     # settings always take precedence over these.
     default_api_keys: dict[str, str] = field(default_factory=dict)

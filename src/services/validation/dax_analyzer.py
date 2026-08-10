@@ -120,6 +120,74 @@ def extract_consistency_rules(measures) -> list[ConsistencyRule]:
 
 
 # --- Power BI format strings -----------------------------------------------
+_CURRENCY_WORDS = (
+    "sales", "cost", "profit", "revenue", "amount", "price", "value",
+    "discount", "margin$", "spend", "budget",
+)
+_COUNT_FUNCS = ("COUNTROWS", "DISTINCTCOUNT", "COUNT(")
+_COUNT_WORDS = ("count", "quantity", "orders", "customers", "resellers", "lines", "units")
+
+
+def infer_format_string(name: str, dax: str) -> str:
+    """Guess a Power BI format string when the model does not supply one.
+
+    ``pbixray`` cannot read measure ``formatString`` from a binary ``.pbix``, so
+    without this every KPI would be compared as a bare float and the results
+    grid would show ``51878274.54`` where the dashboard shows ``$51,878,275``.
+    The guess is deliberately conservative: currency, percentage or integer.
+    """
+    n = (name or "").casefold()
+    d = (dax or "").upper()
+
+    # A percentage is signalled by the name or by a ratio-shaped DAX.
+    if "%" in n or "percent" in n or "rate" in n:
+        return "0.0%"
+    if d.startswith("DIVIDE") and ("margin" in n or "ratio" in n or "share" in n):
+        return "0.0%"
+
+    if any(f in d for f in _COUNT_FUNCS) or any(w in n for w in _COUNT_WORDS):
+        return "#,0"
+
+    if any(w.rstrip("$") in n for w in _CURRENCY_WORDS):
+        # Averages of money keep cents; totals do not.
+        return "\\$#,0.00" if n.startswith(("avg", "average")) else "\\$#,0"
+
+    return "#,0.00"
+
+
+def apply_format(value: float, format_string: str) -> str:
+    """Render *value* the way Power BI would, per its format string.
+
+    Turns the computed number into the string the dashboard actually shows
+    (``51879473.12`` -> ``$51,879,473``), so the expected value handed to the
+    SQL generator and shown in the results grid is the *dashboard reading*,
+    not a raw float.
+
+    Only the common numeric formats are honoured; anything unrecognised falls
+    back to a plain number rather than guessing.
+    """
+    fs = (format_string or "").replace("\\", "").strip()
+    if value is None:
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if not fs:
+        return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+    # Percentages: the stored value is a ratio, the display is x100.
+    if "%" in fs:
+        decimals = len(fs.split(".")[-1].replace("%", "")) if "." in fs else 0
+        return f"{number * 100:.{decimals}f}%"
+
+    decimals = len(fs.split(".")[-1]) if "." in fs else 0
+    thousands = "," if "," in fs else ""
+    body = f"{number:{thousands}.{decimals}f}"
+    return f"${body}" if "$" in fs else body
+
+
 def describe_format(format_string: str) -> str:
     """Turn a Power BI format string into plain guidance for SQL formatting.
 

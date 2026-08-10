@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BI TestPilot AI</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>BI TestPilot AI</h1>
+      <p>Enterprise QA Automation for Business Intelligence</p>
+    </div>
+  </div>
+  <nav class="steps" aria-label="Progress">
+    <span class="step is-active" data-step="1"><b>1</b> Setup</span>
+    <span class="step" data-step="2"><b>2</b> Analysis</span>
+    <span class="step" data-step="3"><b>3</b> Results</span>
+  </nav>
+</header>
+
+<main>
+
+<!-- ══════════════════ SCREEN 1 — SETUP ══════════════════ -->
+<section id="screen-1" class="screen is-visible">
+  <div class="grid">
+
+    <div class="card">
+      <h2><span class="num">1</span> Dashboard file</h2>
+      <p class="hint">Upload a Power BI <code>.pbix</code>, <code>.pbit</code> or a zipped <code>.pbip</code> project.</p>
+      <label class="dropzone" id="pbix-drop">
+        <input type="file" id="pbix-input" accept=".pbix,.pbit,.pbip,.pbir,.zip" hidden>
+        <span class="dz-icon">⬆</span>
+        <span class="dz-text">Drop file here or <u>browse</u></span>
+        <span class="dz-file" id="pbix-name"></span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2><span class="num">2</span> Datasource</h2>
+      <p class="hint">The source of truth that dashboard values are validated against.</p>
+
+      <div class="tabs" role="tablist">
+        <button class="tab is-active" data-ds="file" role="tab">Excel / CSV</button>
+        <button class="tab" data-ds="sql" role="tab">SQL Server</button>
+      </div>
+
+      <div id="ds-file" class="ds-panel is-visible">
+        <label class="dropzone sm" id="data-drop">
+          <input type="file" id="data-input" accept=".xlsx,.xls,.csv" hidden>
+          <span class="dz-icon">⬆</span>
+          <span class="dz-text">Drop <code>.xlsx</code> / <code>.csv</code> or <u>browse</u></span>
+          <span class="dz-file" id="data-name"></span>
+        </label>
+      </div>
+
+      <div id="ds-sql" class="ds-panel">
+        <div class="field-row">
+          <label>Server <input id="sql-server" placeholder="localhost"></label>
+          <label>Database <input id="sql-database" placeholder="AdventureWorks"></label>
+        </div>
+        <div class="field-row">
+          <label>Authentication
+            <select id="sql-auth">
+              <option value="SQL Login">SQL Login</option>
+              <option value="Windows Authentication">Windows Authentication</option>
+            </select>
+          </label>
+          <label>ODBC driver
+            <select id="sql-driver">
+              <option>ODBC Driver 17 for SQL Server</option>
+              <option>ODBC Driver 18 for SQL Server</option>
+              <option>SQL Server</option>
+            </select>
+          </label>
+        </div>
+        <div class="field-row" id="sql-creds">
+          <label>Username <input id="sql-user" placeholder="sa"></label>
+          <label>Password <input id="sql-pass" type="password"></label>
+        </div>
+        <button class="btn ghost sm" id="btn-test">Test connection</button>
+      </div>
+
+      <p class="status" id="ds-status"></p>
+    </div>
+  </div>
+
+  <details class="card llm" id="llm-card">
+    <summary>
+      <span class="sum-left"><span class="num">3</span> AI model</span>
+      <span class="badge" id="llm-badge">Not configured</span>
+    </summary>
+    <p class="hint">
+      Required for SQL generation, test cases and AI reasoning. Without it the run
+      still produces metadata, DAX evaluation and a report — but no SQL validation.
+      Your key is stored locally and never sent to the browser again.
+    </p>
+    <div class="field-row">
+      <label>Provider <select id="llm-provider"></select></label>
+      <label>Preset
+        <select id="llm-preset"><option value="">— choose to autofill —</option></select>
+      </label>
+    </div>
+    <div class="field-row">
+      <label>API key <input id="llm-key" type="password" placeholder="leave blank to keep stored key"></label>
+      <label>Model <input id="llm-model" placeholder="e.g. llama-3.3-70b-versatile"></label>
+    </div>
+    <div class="field-row">
+      <label>Base URL <input id="llm-base" placeholder="provider default"></label>
+      <label>Max tokens <input id="llm-max" type="number" value="2048" min="256" max="32000" step="256"></label>
+    </div>
+    <div class="llm-actions">
+      <button class="btn ghost sm" id="btn-llm-models">Fetch models</button>
+      <button class="btn ghost sm" id="btn-llm-test">Test</button>
+      <button class="btn primary sm" id="btn-llm-save">Save</button>
+    </div>
+    <p class="status" id="llm-status"></p>
+  </details>
+
+  <div class="actions">
+    <label class="tolerance">Tolerance
+      <input id="tolerance" type="number" value="1" min="0" max="50" step="0.5"> %
+    </label>
+    <button class="btn primary lg" id="btn-analyze" disabled>Analyze ▸</button>
+  </div>
+  <p class="status center" id="setup-status"></p>
+</section>
+
+<!-- ══════════════════ SCREEN 2 — PROGRESS ══════════════════ -->
+<section id="screen-2" class="screen">
+  <div class="card wide">
+    <h2 id="run-title">Running analysis…</h2>
+    <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+    <div class="bar-meta">
+      <span id="bar-pct">0%</span>
+      <span id="bar-elapsed">0.0s</span>
+    </div>
+    <ol class="stages" id="stages"></ol>
+    <button class="btn ghost" id="btn-cancel">Cancel run</button>
+  </div>
+</section>
+
+<!-- ══════════════════ SCREEN 3 — RESULTS ══════════════════ -->
+<section id="screen-3" class="screen">
+  <div class="metrics">
+    <div class="metric"><span class="m-label">Tests</span><span class="m-value" id="m-tests">0</span></div>
+    <div class="metric pass"><span class="m-label">Passed</span><span class="m-value" id="m-passed">0</span></div>
+    <div class="metric fail"><span class="m-label">Failed</span><span class="m-value" id="m-failed">0</span></div>
+    <div class="metric warn"><span class="m-label">Warnings</span><span class="m-value" id="m-warnings">0</span></div>
+    <div class="metric"><span class="m-label">Duration</span><span class="m-value" id="m-time">—</span></div>
+  </div>
+
+  <div id="warn-box" class="warnbox" hidden>
+    <strong>Completed with warnings</strong>
+    <ul id="warn-list"></ul>
+  </div>
+
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Validation results</h2>
+      <div class="downloads">
+        <a class="btn ghost sm" id="dl-html" target="_blank" rel="noopener">HTML</a>
+        <a class="btn ghost sm" id="dl-pdf">PDF</a>
+        <a class="btn ghost sm" id="dl-xlsx">Excel</a>
+        <button class="btn primary sm" id="btn-explain">Explain failures with AI</button>
+      </div>
+    </div>
+    <p class="status" id="explain-status"></p>
+    <div class="table-wrap">
+      <table id="results">
+        <thead><tr>
+          <th>Test ID</th><th>KPI</th><th>Scenario</th><th>Dashboard reading</th>
+          <th>Query used to fetch</th><th>Database</th><th>Diff</th>
+          <th>Match</th><th>ms</th><th>Status</th>
+        </tr></thead>
+        <tbody id="results-body"></tbody>
+      </table>
+      <p class="empty" id="results-empty" hidden>
+        No SQL validations ran. Configure a <b>SQL Server</b> datasource and an
+        <b>LLM</b> to generate and execute queries.
+      </p>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn ghost" id="btn-restart">← New analysis</button>
+  </div>
+</section>
+
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

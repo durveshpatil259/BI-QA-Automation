@@ -426,29 +426,89 @@ class DbSchema(SerializableMixin):
             "foreign_keys": sum(len(t.foreign_keys) for t in self.tables),
         }
 
-    def compact_text(self, max_tables: int = 60) -> str:
-        """A compact textual rendering for inclusion in an AI prompt.
+    def relevant_tables(self, wanted: set[str]) -> list[DbTable]:
+        """Tables matching *wanted* names, plus anything they join to.
 
-        Includes real sample values and inferred join paths — without these the
-        model cannot write correct WHERE clauses or multi-table joins.
+        A warehouse may hold 50 tables while the dashboard touches 11. Sending
+        all of them wastes the model's token budget and adds noise that hurts
+        mapping accuracy, so the prompt is narrowed to the relevant subgraph.
         """
+        if not wanted:
+            return list(self.tables)
+
+        target = {w.strip().casefold() for w in wanted if w}
+        by_name = {t.full_name.casefold(): t for t in self.tables}
+
+        def bare(name: str) -> str:
+            return name.rsplit(".", 1)[-1].casefold()
+
+        keep = {
+            t.full_name.casefold() for t in self.tables
+            if bare(t.full_name) in target or t.name.casefold() in target
+        }
+        if not keep:
+            return list(self.tables)
+
+        # Pull in direct join partners — a filter often lives one hop away.
+        for hint in self.join_hints:
+            a, b = hint.from_table.casefold(), hint.to_table.casefold()
+            if a in keep and b in by_name:
+                keep.add(b)
+            elif b in keep and a in by_name:
+                keep.add(a)
+
+        return [t for t in self.tables if t.full_name.casefold() in keep]
+
+    def compact_text(
+        self,
+        max_tables: int = 60,
+        *,
+        wanted: set[str] | None = None,
+        max_columns: int = 40,
+        max_samples: int = 4,
+        include_samples: bool = False,
+        include_row_counts: bool = False,
+    ) -> str:
+        """Render the schema for an AI prompt — **identifiers only by default**.
+
+        Security posture: an LLM needs table and column *names* to write SQL at
+        all, but it never needs the *contents* of those columns. Sample values
+        are real production data (customer names, emails, account numbers) and
+        are therefore **off by default**; ``include_samples=True`` is an
+        explicit, informed opt-in. Row counts are likewise withheld, as volumes
+        can be commercially sensitive.
+
+        Pass *wanted* (the dashboard's table names) to send only the tables the
+        report actually uses — least privilege, and less noise for the model.
+        """
+        tables = self.relevant_tables(wanted or set())
         lines: list[str] = ["TABLES:"]
-        for t in self.tables[:max_tables]:
-            lines.append(f"  {t.full_name} [{t.kind}]"
-                         + (f" ~{t.row_count} rows" if t.row_count is not None else ""))
-            for c in t.columns:
+        for t in tables[:max_tables]:
+            counts = (
+                f" ~{t.row_count} rows"
+                if include_row_counts and t.row_count is not None else ""
+            )
+            lines.append(f"  {t.full_name} [{t.kind}]{counts}")
+            for c in t.columns[:max_columns]:
                 marks = " (PK)" if c.is_primary_key else ""
                 samples = ""
-                if c.sample_values:
-                    shown = ", ".join(repr(v) for v in c.sample_values[:6])
+                if include_samples and c.sample_values:
+                    shown = ", ".join(repr(v) for v in c.sample_values[:max_samples])
                     samples = f"  e.g. {shown}"
                 lines.append(f"      {c.name}: {c.data_type}{marks}{samples}")
+            if len(t.columns) > max_columns:
+                lines.append(f"      … and {len(t.columns) - max_columns} more columns")
             for fk in t.foreign_keys:
                 lines.append(
                     f"      FK {t.full_name}.{fk.column} -> {fk.ref_table}.{fk.ref_column}"
                 )
-        if len(self.tables) > max_tables:
-            lines.append(f"  … and {len(self.tables) - max_tables} more tables")
+        if len(tables) > max_tables:
+            lines.append(f"  … and {len(tables) - max_tables} more tables")
+        if len(tables) < len(self.tables):
+            lines.append(
+                f"  (showing {len(tables)} of {len(self.tables)} database tables — "
+                "those referenced by the dashboard and their join partners)"
+            )
 
         if self.join_hints:
             lines.append("")

@@ -22,6 +22,7 @@ from src.services.llm_service import LLMService
 from src.services.metadata_service import MetadataService
 from src.services.project_service import ProjectService
 from src.services.reporting import ReportService
+from src.services.pbix_data_service import PbixDataService
 from src.services.schema_service import SchemaService
 from src.services.screenshot_service import ScreenshotService
 from src.services.sql_validation_engine import SqlValidationEngine
@@ -54,10 +55,28 @@ class AppContext:
     test_case_service: TestCaseService
     report_service: ReportService
     schema_service: SchemaService
+    pbix_data_service: PbixDataService
     vision_service: VisionService
     validation_plan_service: ValidationPlanService
     sql_validation_engine: SqlValidationEngine
     test_expansion_service: TestExpansionService
+
+    def pipeline_runner(self):
+        """Build the one-click pipeline orchestrator from these services."""
+        from src.pipeline.runner import PipelineRunner, PipelineServices
+
+        return PipelineRunner(PipelineServices(
+            datasource_service=self.datasource_service,
+            metadata_service=self.metadata_service,
+            schema_service=self.schema_service,
+            analysis_service=self.analysis_service,
+            llm_service=self.llm_service,
+            validation_plan_service=self.validation_plan_service,
+            sql_validation_engine=self.sql_validation_engine,
+            test_expansion_service=self.test_expansion_service,
+            report_service=self.report_service,
+            dax_evaluation_service=self.pbix_data_service,
+        ))
 
     @classmethod
     def create(cls) -> "AppContext":
@@ -77,6 +96,7 @@ class AppContext:
             test_case_service=TestCaseService(repo),
             report_service=ReportService(repo),
             schema_service=SchemaService(repo),
+            pbix_data_service=PbixDataService(repo),
             vision_service=VisionService(repo),
             validation_plan_service=ValidationPlanService(repo),
             sql_validation_engine=SqlValidationEngine(repo),

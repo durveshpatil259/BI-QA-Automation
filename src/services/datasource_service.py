@@ -86,8 +86,8 @@ class DatasourceService:
                 raise ValidationError("Database is required for SQL Server.")
             if config.auth_mode == SqlAuthMode.SQL_LOGIN and not config.username.strip():
                 raise ValidationError("Username is required for SQL Login.")
-        elif config.type == DatasourceType.EXCEL:
+        elif config.type in (DatasourceType.EXCEL, DatasourceType.CSV):
             if not config.excel_path.strip():
-                raise ValidationError("Excel file path is required.")
+                raise ValidationError(f"{config.type} file path is required.")
         else:  # pragma: no cover - guarded by enum
             raise ValidationError(f"Unsupported datasource type: {config.type}")

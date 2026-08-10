@@ -584,76 +584,55 @@ def _data_validation_step(ctx: AppContext, project) -> None:
 
 
 def _run_full_analysis(ctx: AppContext, project) -> None:
-    """One-click orchestration of the whole pipeline.
+    """One-click run, delegated to the deterministic PipelineRunner.
 
-    Runs every applicable deterministic step, then (if an LLM is configured) the
-    AI reasoning and test-case generation, and finally builds the report — so
-    the user can simply upload assets and click one button.
+    The runner owns stage order, failure policy and progress reporting, so the
+    Streamlit UI, the API layer and the tests all drive identical logic.
     """
-    mode = project.analysis_mode
-    steps_done: list[str] = []
-    try:
-        with st.status("Running full analysis…", expanded=True) as status:
-            if _needs_metadata(mode) and ctx.metadata_service.has_dashboard_file(project):
-                st.write("① Extracting dashboard metadata…")
-                ctx.metadata_service.extract(project)
-                steps_done.append("metadata")
+    from src.pipeline import PipelineContext, ProgressReporter, STAGE_ORDER
 
-            if _needs_visual(mode) and ctx.screenshot_service.has_screenshots(project):
-                st.write("② Processing screenshots…")
-                ctx.screenshot_service.process(project)
-                steps_done.append("screenshots")
+    runner = ctx.pipeline_runner()
+    pctx = PipelineContext(project=project)
 
-            st.write("③ Comparing & validating (building analysis context)…")
-            context = ctx.analysis_service.build_context(project)
-            steps_done.append("context")
+    with st.status("Running full analysis…", expanded=True) as status:
+        placeholder = st.empty()
 
-            # AI steps are best-effort: a provider/rate-limit error must not
-            # discard the deterministic work — we still build the report.
-            ai_errors: list[str] = []
-            settings = ctx.llm_service.load_settings(project)
-            if settings.is_configured:
-                st.write(f"④ Generating AI reasoning via {settings.provider}…")
-                try:
-                    ctx.llm_service.generate(project, context, settings)
-                    steps_done.append("ai_reasoning")
-                except BITestPilotError as exc:
-                    ai_errors.append(f"AI reasoning: {exc}")
-                    st.warning(f"AI reasoning skipped — {exc}")
+        def sink(event):
+            icon = {"running": "⏳", "done": "✅",
+                    "skipped": "⚠️", "failed": "❌"}.get(event.status, "•")
+            placeholder.write(f"{icon} {event.message}")
 
-                st.write("⑤ Generating unit & QA test cases…")
-                try:
-                    ctx.test_case_service.generate(project, context, settings)
-                    steps_done.append("test_cases")
-                except BITestPilotError as exc:
-                    ai_errors.append(f"Test cases: {exc}")
-                    st.warning(f"Test-case generation skipped — {exc}")
-            else:
-                st.write("④ Skipping AI steps — no LLM configured (see Step 4 below).")
-
-            st.write("⑥ Building validation report…")
-            ctx.report_service.build_report(project)
-            steps_done.append("report")
-
+        reporter = ProgressReporter("ui", len(STAGE_ORDER), sink=sink)
+        try:
+            runner.run(pctx, reporter)
             status.update(label="Full analysis complete.", state="complete")
+        except BITestPilotError as exc:
+            status.update(label="Analysis stopped.", state="error")
+            st.error(f"Analysis stopped: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - surface unexpected failures
+            status.update(label="Analysis stopped.", state="error")
+            st.error(f"Analysis stopped: {exc}")
+            return
 
-        ai_ok = {"ai_reasoning", "test_cases"} & set(steps_done)
-        if ai_errors:
-            st.warning(
-                "Deterministic analysis and report are ready, but some AI steps did not "
-                "complete:\n\n- " + "\n- ".join(ai_errors) +
-                "\n\nOn free tiers this is usually a per-minute token limit — lower "
-                "**Max tokens** to 1024, wait a minute, then retry the AI steps below."
-            )
-        elif ai_ok:
-            st.success("Done — metadata, validation, AI reasoning, test cases and report are ready.")
-        else:
-            st.success(
-                "Deterministic analysis and report are ready. Configure an LLM in "
-                "Step 4 to add AI reasoning and test cases, then run again."
-            )
-    except BITestPilotError as exc:
-        st.error(f"Analysis stopped: {exc}")
+    for event in reporter.events:
+        if event.status == "done":
+            st.caption(f"✅ {event.message}")
+
+    summary = pctx.summary()
+    cols = st.columns(4)
+    cols[0].metric("Tests", summary["tests"])
+    cols[1].metric("Passed", summary["passed"])
+    cols[2].metric("Failed", summary["failed"])
+    cols[3].metric("Elapsed", f"{reporter.elapsed_ms / 1000:.1f}s")
+
+    if pctx.warnings:
+        st.warning(
+            "Completed with warnings — some stages were skipped:\n\n- "
+            + "\n- ".join(pctx.warnings)
+        )
+    else:
+        st.success("Done — metadata, validation, AI reasoning, test cases and report are ready.")
 
 
 def render(ctx: AppContext) -> None:

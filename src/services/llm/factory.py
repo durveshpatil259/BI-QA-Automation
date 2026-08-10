@@ -8,7 +8,9 @@ from src.domain.models import LLMSettings
 from src.services.llm.base import LLMClient
 from src.services.llm.providers import (
     DeepSeekClient,
+    GeminiClient,
     GrokClient,
+    GroqClient,
     OpenAIClient,
     PendingClient,
     QwenClient,
@@ -17,6 +19,8 @@ from src.services.llm.providers import (
 # Providers that share the OpenAI-compatible client, ready to use today.
 _ACTIVE: dict[LLMProvider, type[LLMClient]] = {
     LLMProvider.GROK: GrokClient,
+    LLMProvider.GROQ: GroqClient,
+    LLMProvider.GEMINI: GeminiClient,
     LLMProvider.OPENAI: OpenAIClient,
     LLMProvider.DEEPSEEK: DeepSeekClient,
     LLMProvider.QWEN: QwenClient,
@@ -25,7 +29,6 @@ _ACTIVE: dict[LLMProvider, type[LLMClient]] = {
 # Providers whose dedicated (non-OpenAI-compatible) client ships later.
 _PENDING: dict[LLMProvider, str] = {
     LLMProvider.CLAUDE: "Module 8b",
-    LLMProvider.GEMINI: "Module 8c",
     LLMProvider.LLAMA: "Module 8d",
 }
 

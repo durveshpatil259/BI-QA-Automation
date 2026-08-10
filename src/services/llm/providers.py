@@ -39,6 +39,30 @@ class QwenClient(OpenAICompatibleClient):
     default_model = "qwen-plus"
 
 
+class GroqClient(OpenAICompatibleClient):
+    """Groq Cloud — OpenAI-compatible, with a free tier.
+
+    Not to be confused with xAI's **Grok** (:class:`GrokClient`); the near
+    identical names are a genuine source of confusion.
+    """
+
+    default_base_url = "https://api.groq.com/openai/v1"
+    default_model = "llama-3.3-70b-versatile"
+
+
+class GeminiClient(OpenAICompatibleClient):
+    """Google Gemini via its OpenAI-compatible endpoint.
+
+    The base URL **must** end in ``/openai``. Google's plain ``/v1beta`` path is
+    the native Gemini API, which expects an ``x-goog-api-key`` header rather
+    than ``Authorization: Bearer`` — pointing at it returns a confusing
+    ``401 Expected OAuth 2 access token``. :meth:`base_url` normalises this.
+    """
+
+    default_base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    default_model = "gemini-2.0-flash"
+
+
 class PendingClient(LLMClient):
     """Placeholder for providers whose dedicated client is not implemented yet."""
 

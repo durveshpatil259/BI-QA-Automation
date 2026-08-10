@@ -66,6 +66,7 @@ class DatasourceType(StrEnum):
 
     SQL_SERVER = "SQL Server"
     EXCEL = "Excel"
+    CSV = "CSV"
 
 
 class SqlAuthMode(StrEnum):
@@ -81,7 +82,8 @@ class LLMProvider(StrEnum):
     API keys for every provider.
     """
 
-    GROK = "Grok"
+    GROK = "Grok"          # xAI
+    GROQ = "Groq"          # Groq Cloud — different company, has a free tier
     CLAUDE = "Claude"
     OPENAI = "OpenAI"
     GEMINI = "Gemini"

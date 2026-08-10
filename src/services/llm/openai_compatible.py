@@ -12,6 +12,9 @@ parsing can be unit-tested without network access.
 
 from __future__ import annotations
 
+import re
+import time
+
 from src.core.exceptions import LLMConfigError, LLMProviderError, LLMResponseError
 from src.core.logger import get_logger
 from src.services.llm.base import LLMClient, LLMMessage, LLMResponse
@@ -19,6 +22,10 @@ from src.services.llm.base import LLMClient, LLMMessage, LLMResponse
 _logger = get_logger()
 
 _DEFAULT_TIMEOUT = 90  # seconds
+#: Free tiers throttle aggressively and a full run makes ~20 calls, so a few
+#: automatic retries turn a hard failure into a short pause.
+_MAX_RETRIES = 3
+_MAX_RETRY_WAIT = 30  # seconds — never stall a run longer than this
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -28,8 +35,36 @@ class OpenAICompatibleClient(LLMClient):
     default_base_url: str = ""
 
     @property
+    def model(self) -> str:
+        """Model id, normalised for the OpenAI-compatible wire format.
+
+        Gemini's ``/models`` endpoint returns ids as ``models/gemini-2.5-flash``
+        while its chat endpoint expects ``gemini-2.5-flash``. Accepting either
+        means pasting straight from the model list just works.
+        """
+        name = super().model
+        return name[len("models/"):] if name.startswith("models/") else name
+
+    @property
     def base_url(self) -> str:
         url = (self.settings.base_url or self.default_base_url).strip().rstrip("/")
+        return self._normalise_base_url(url)
+
+    @staticmethod
+    def _normalise_base_url(url: str) -> str:
+        """Repair base URLs that are *almost* right.
+
+        Google's Gemini exposes two different APIs under the same host:
+        ``/v1beta`` is the native one (``x-goog-api-key`` header) and
+        ``/v1beta/openai`` is the OpenAI-compatible one (``Bearer`` token).
+        Pointing an OpenAI-style client at the former fails with a misleading
+        ``401 Expected OAuth 2 access token``, so append the missing segment
+        rather than let the user hit that.
+        """
+        if not url:
+            return url
+        if "generativelanguage.googleapis.com" in url and not url.endswith("/openai"):
+            return url + "/openai"
         return url
 
     # --- request/response (pure, testable) --------------------------------
@@ -62,38 +97,180 @@ class OpenAICompatibleClient(LLMClient):
 
     # --- transport (isolated for testing) ---------------------------------
     def _post(self, payload: dict) -> dict:
+        """POST with automatic back-off on rate limits.
+
+        A full analysis issues ~20 calls, which reliably trips the per-minute
+        limits of every free tier. Retrying with the provider's own suggested
+        delay turns a hard failure into a short pause.
+        """
         import requests
 
         endpoint = f"{self.base_url}/chat/completions"
-        try:
-            resp = requests.post(
-                endpoint, json=payload, headers=self._headers(), timeout=_DEFAULT_TIMEOUT
-            )
-        except requests.RequestException as exc:
-            raise LLMProviderError(f"Network error calling {endpoint}: {exc}") from exc
+        last_detail = ""
 
-        if resp.status_code >= 400:
-            detail = self._error_detail(resp)
-            raise LLMProviderError(
-                f"{self.settings.provider} API error {resp.status_code}: {detail}"
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    endpoint, json=payload, headers=self._headers(),
+                    timeout=_DEFAULT_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                raise LLMProviderError(f"Network error calling {endpoint}: {exc}") from exc
+
+            if resp.status_code < 400:
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    raise LLMResponseError("Provider returned non-JSON response.") from exc
+
+            last_detail = self._error_detail(resp)
+            retryable = resp.status_code == 429 or resp.status_code >= 500
+
+            # A zero quota is a configuration problem, not congestion — no
+            # amount of waiting will fix it, so fail fast with clear guidance.
+            body_text = resp.text or ""
+            # Billing exhaustion looks like a rate limit but never clears on
+            # its own — retrying just wastes the user's time.
+            if resp.status_code == 429 and any(
+                s in body_text.lower() for s in
+                ("credits are depleted", "insufficient_quota", "billing details",
+                 "exceeded your current quota, please check your plan")
+            ) and "limit: 0" not in body_text:
+                raise LLMProviderError(
+                    f"{self.settings.provider}: this account is out of credit — "
+                    "the API key works but has no remaining balance. Top up "
+                    "billing for the project, or switch provider (Groq has a "
+                    f"working free tier). Provider said: {last_detail}"
+                )
+
+            if resp.status_code == 429 and "limit: 0" in body_text:
+                raise LLMProviderError(
+                    f"'{self.model}' has NO quota on this API key (limit: 0), so "
+                    "even the first request is rejected — quota is granted "
+                    "per-model, so the key itself may be fine.\n"
+                    + self._suggest_models()
+                )
+
+            if not retryable or attempt == _MAX_RETRIES:
+                raise LLMProviderError(
+                    f"{self.settings.provider} API error {resp.status_code}: {last_detail}"
+                )
+
+            delay = self._retry_after_seconds(resp, body_text) or (2 ** attempt)
+            delay = min(delay + 0.5, _MAX_RETRY_WAIT)
+            _logger.info(
+                "%s returned %s; retrying in %.1fs (attempt %d/%d)",
+                self.settings.provider, resp.status_code, delay,
+                attempt + 1, _MAX_RETRIES,
             )
+            time.sleep(delay)
+
+        raise LLMProviderError(f"{self.settings.provider}: {last_detail}")
+
+    #: Model ids that cannot serve a chat-completion request, or that are
+    #: research/preview endpoints unsuitable for bulk SQL generation.
+    _NOT_CHAT = (
+        "embed", "aqa", "imagen", "veo", "tts", "-image", "computer-use",
+        "deep-research", "antigravity", "learnlm", "-vision",
+    )
+
+    @staticmethod
+    def _rank_model(name: str) -> tuple:
+        """Sort key preferring stable, general-purpose chat models."""
+        n = name.lower()
+        preview = any(t in n for t in ("preview", "exp", "experimental"))
+        # Prefer newest major line, then flash (cheap/fast) over pro.
+        version = 0
+        for v in ("3.0", "2.5", "2.0", "1.5"):
+            if v in n:
+                version = -float(v)
+                break
+        return (preview, "lite" in n, version, "pro" in n, len(n))
+
+    def _suggest_models(self) -> str:
+        """Name models this key can actually use, so the fix is one click away.
+
+        A ``limit: 0`` response means the *model* has no allocation, not that
+        the key is bad — naming a concrete alternative turns a dead end into a
+        single edit.
+        """
         try:
-            return resp.json()
-        except ValueError as exc:
-            raise LLMResponseError("Provider returned non-JSON response.") from exc
+            available = self.list_models()
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the error
+            available = []
+
+        if not available:
+            return (
+                "Click 'Fetch models' to see what this key supports, pick one, "
+                "and try again — or switch to another provider (Groq's free tier "
+                "works well here)."
+            )
+
+        def bare(name: str) -> str:
+            n = name.lower()
+            return n[len("models/"):] if n.startswith("models/") else n
+
+        # Compare on the bare id so the failing model is excluded whether the
+        # list returns it prefixed or not.
+        current = bare(self.model)
+        chat = [
+            m for m in available
+            if not any(skip in m.lower() for skip in self._NOT_CHAT)
+            and bare(m) != current
+        ]
+        chat.sort(key=self._rank_model)
+        if not chat:
+            return "No alternative chat models are available on this key."
+
+        best = chat[0]
+        others = ", ".join(chat[1:6])
+        return (
+            f"Try '{best}' instead — set it in the Model field and click Test."
+            + (f"\nOther options: {others}" if others else "")
+        )
 
     @staticmethod
     def _error_detail(resp) -> str:
+        """Extract the human-readable message from a provider error body.
+
+        Providers nest the useful sentence at different depths (and Gemini
+        wraps it in a list), so dumping the raw JSON at the user is unhelpful.
+        """
         try:
             body = resp.json()
-            if isinstance(body, dict):
-                err = body.get("error")
-                if isinstance(err, dict):
-                    return err.get("message", str(err))
-                return str(err or body)
-            return str(body)
         except ValueError:
             return (resp.text or "")[:300]
+
+        # Gemini returns [{"error": {...}}]; OpenAI-style returns {"error": {...}}
+        if isinstance(body, list) and body:
+            body = body[0]
+        if isinstance(body, dict):
+            err = body.get("error", body)
+            if isinstance(err, dict):
+                message = str(err.get("message", "")).strip()
+                if message:
+                    # Keep the first sentence/line — the rest is quota tables
+                    # and doc links that overwhelm the UI.
+                    return message.split("\n")[0].strip()
+                return str(err)[:300]
+            return str(err)[:300]
+        return str(body)[:300]
+
+    @staticmethod
+    def _retry_after_seconds(resp, body_text: str) -> float | None:
+        """Seconds to wait before retrying, per the provider's own guidance."""
+        header = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                pass
+        # Gemini embeds {"retryDelay": "7s"} in the error payload.
+        match = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', body_text or "")
+        if match:
+            return float(match.group(1))
+        match = re.search(r"retry in (\d+(?:\.\d+)?)s", body_text or "", re.IGNORECASE)
+        return float(match.group(1)) if match else None
 
     # --- discovery --------------------------------------------------------
     def list_models(self) -> list[str]:

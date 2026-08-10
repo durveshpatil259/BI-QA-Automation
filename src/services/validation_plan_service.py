@@ -82,6 +82,115 @@ class ValidationPlanService:
         "actionbutton", "multirowcard",
     }
 
+    #: Upper bound on filter scenarios. 4 slicers x 4 values x 30 measures would
+    #: be hundreds of LLM-generated queries; this keeps a run practical while
+    #: still covering every value of the most important slicers.
+    MAX_SCENARIOS = 10
+
+    def _data_backed_scenarios(self, project, metadata, fmt_by_name) -> list[dict]:
+        """Build scenarios with real expected values read from the PBIX data.
+
+        Produces an unfiltered baseline plus one scenario per slicer value, so
+        e.g. Fiscal Year FY2018/FY2019/FY2020/FY2021 each become their own set
+        of validations with the exact number Power BI would render.
+        """
+        from src.services.pbix_data_service import PbixDataService
+
+        data = PbixDataService(self._repo)
+        try:
+            baseline = data.evaluate(project, metadata)
+        except Exception as exc:  # noqa: BLE001 - data optional
+            _logger.info("Data-backed evaluation unavailable: %s", exc)
+            return []
+        if not baseline:
+            return []
+
+        from src.services.validation.dax_analyzer import (
+            apply_format,
+            describe_format,
+            infer_format_string,
+        )
+
+        dax_of, raw_fmt_of = {}, {}
+        for m in metadata.all_measures:
+            if not m.name:
+                continue
+            key = m.name.casefold()
+            dax_of[key] = m.dax_expression or ""
+            # A native .pbix carries no formatString, so infer one — otherwise
+            # every KPI is compared as a bare float.
+            raw_fmt_of[key] = m.format_string or infer_format_string(
+                m.name, m.dax_expression or ""
+            )
+            fmt_by_name.setdefault(key, describe_format(raw_fmt_of[key]))
+            if not fmt_by_name.get(key):
+                fmt_by_name[key] = describe_format(raw_fmt_of[key])
+
+        def kpis_for(values: dict[str, str]) -> list[tuple]:
+            """Render each computed number as the dashboard would display it."""
+            out = []
+            for name, value in values.items():
+                key = name.casefold()
+                try:
+                    displayed = apply_format(float(value), raw_fmt_of.get(key, ""))
+                except (TypeError, ValueError):
+                    displayed = str(value)
+                out.append((name, displayed, dax_of.get(key, ""), fmt_by_name.get(key, "")))
+            return out
+
+        visuals = self._visuals_from_metadata(metadata)
+        scenarios: list[dict] = [{
+            "id": "S1", "label": "All data (no slicer applied)",
+            "view_name": "", "filters": [], "kpis": kpis_for(baseline),
+            "visuals": visuals,
+        }]
+
+        # Slicers with the fewest values first — those are the meaningful
+        # analytic dimensions (fiscal year, channel) rather than long lists.
+        try:
+            options = sorted(
+                data.detect_filters(project, metadata), key=lambda o: len(o.values)
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.info("Slicer detection failed: %s", exc)
+            options = []
+
+        from src.core.config import load_config as _load_cfg
+
+        max_scenarios = int(getattr(_load_cfg(), 'max_scenarios',
+                                    self.MAX_SCENARIOS) or self.MAX_SCENARIOS)
+        index = 2
+        for option in options:
+            for value in option.values:
+                if index > max_scenarios:
+                    break
+                try:
+                    values = data.evaluate(
+                        project, metadata,
+                        filter_spec=(option.table, option.column, value),
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if not values:
+                    continue
+                scenarios.append({
+                    "id": f"S{index}",
+                    "label": f"{option.column}={value}",
+                    "view_name": "",
+                    "filters": [(f"{option.table}[{option.column}]", value)],
+                    "kpis": kpis_for(values),
+                    # Charts are validated once, on the baseline scenario.
+                    "visuals": [],
+                })
+                index += 1
+            if index > max_scenarios:
+                break
+
+        _logger.info(
+            "Built %d data-backed scenario(s) with real expected values", len(scenarios)
+        )
+        return scenarios
+
     def _visuals_from_metadata(self, metadata) -> list[dict]:
         """Build chart descriptors from the PBIX/PBIT report layout.
 
@@ -211,8 +320,14 @@ class ValidationPlanService:
             })
 
         if not scenarios and metadata:
-            # PBIX/PBIT-only mode: no screenshot, so there is no displayed value.
-            # The measure's DAX and its Power BI format string drive the SQL.
+            # PBIX-only mode. Evaluate the measures against the data inside the
+            # file — both unfiltered and under each slicer selection — so every
+            # condition the dashboard can show becomes a validated scenario
+            # with a REAL expected value, no screenshot required.
+            scenarios.extend(self._data_backed_scenarios(project, metadata, fmt_by_name))
+
+        if not scenarios and metadata:
+            # Fall back to names + DAX + format only (no data available).
             measures = [
                 (m.name, "", m.dax_expression or "",
                  describe_format(m.format_string))
@@ -270,31 +385,168 @@ class ValidationPlanService:
 
         dialect = _DIALECTS.get(schema.datasource_type, "ANSI SQL")
         client = client or create_client(settings)
-        response = client.complete(
-            PLAN_SYSTEM_PROMPT.replace("{dialect}", dialect),
-            build_plan_user_prompt(scenarios, schema.compact_text(), dialect),
+        system = PLAN_SYSTEM_PROMPT.replace("{dialect}", dialect)
+        # Send only the tables the dashboard actually touches (plus their join
+        # partners). A warehouse can hold 50 tables while the model uses 11;
+        # the rest is pure token cost and mapping noise.
+        model_meta = self._repo.load_metadata(project)
+        wanted = {t.name for t in (model_meta.tables if model_meta else [])}
+        from src.core.config import load_config
+
+        # Identifiers only unless the operator has explicitly opted in.
+        allow_samples = bool(getattr(load_config(), 'send_sample_values_to_llm', False))
+        schema_text = schema.compact_text(wanted=wanted, include_samples=allow_samples)
+        _logger.info(
+            "Schema prompt: %d of %d tables, ~%d chars",
+            len(schema.relevant_tables(wanted)), len(schema.tables), len(schema_text),
         )
 
-        items = self._parse(response.content, scenarios)
+        # One call per batch: asking for 30+ queries at once reliably overflows
+        # the output budget and truncates the JSON mid-object.
+        batch_size = int(getattr(load_config(), 'max_items_per_call',
+                                 self.MAX_ITEMS_PER_CALL) or self.MAX_ITEMS_PER_CALL)
+        batches = self._batch_scenarios(scenarios, batch_size)
+        items: list[ValidationPlanItem] = []
+        raw_parts: list[str] = []
+        errors: list[str] = []
+        model_name = client.model
+
+        for index, batch in enumerate(batches, start=1):
+            try:
+                response = client.complete(
+                    system, build_plan_user_prompt(batch, schema_text, dialect)
+                )
+            except Exception as exc:  # noqa: BLE001 - one batch must not kill all
+                errors.append(f"batch {index}: {exc}")
+                _logger.warning("Plan batch %d/%d failed: %s", index, len(batches), exc)
+                continue
+
+            model_name = response.model or model_name
+            raw_parts.append(f"--- batch {index} ---\n{response.content}")
+            try:
+                items.extend(self._parse(response.content, batch))
+            except LLMResponseError as exc:
+                errors.append(f"batch {index}: {exc}")
+                _logger.warning("Plan batch %d/%d unparseable: %s", index, len(batches), exc)
+
+        if not items:
+            raise LLMResponseError(
+                "Could not generate any SQL. " + (errors[0] if errors else "")
+            )
+
+        # A batch may echo back a KPI that belonged to another batch; keep the
+        # first (highest-confidence) mapping per scenario/KPI/type.
+        deduped: dict[tuple[str, str, str], ValidationPlanItem] = {}
+        for item in items:
+            key = (item.scenario, item.kpi_name.casefold(), item.item_type)
+            existing = deduped.get(key)
+            if existing is None or item.confidence > existing.confidence:
+                deduped[key] = item
+        items = list(deduped.values())
+
         plan = ValidationPlan(
             items=items,
             provider=settings.provider,
-            model=response.model or client.model,
-            raw_response=response.content,
+            model=model_name,
+            raw_response="\n\n".join(raw_parts),
         )
         self._repo.save_validation_plan(project, plan)
-        _logger.info("Validation plan for %s: %d item(s)", project.id, len(items))
+        _logger.info(
+            "Validation plan for %s: %d item(s) from %d batch(es); %d batch error(s)",
+            project.id, len(items), len(batches), len(errors),
+        )
         return plan
 
     # --- parsing ----------------------------------------------------------
+    #: Requesting too many queries at once overflows the model's output budget
+    #: and truncates the JSON. Batching keeps each response comfortably small.
+    MAX_ITEMS_PER_CALL = 10
+
     @staticmethod
-    def _parse(content: str, scenarios: list[dict]) -> list[ValidationPlanItem]:
+    def _batch_scenarios(scenarios: list[dict], max_items: int) -> list[list[dict]]:
+        """Split scenarios so each batch asks for at most *max_items* queries."""
+        batches: list[list[dict]] = []
+        current: list[dict] = []
+        used = 0
+
+        for scenario in scenarios:
+            kpis = list(scenario.get("kpis", []))
+            visuals = list(scenario.get("visuals", []))
+            k = v = 0
+            while k < len(kpis) or v < len(visuals):
+                if used >= max_items:
+                    batches.append(current)
+                    current, used = [], 0
+                room = max_items - used
+                take_k = kpis[k : k + room]
+                k += len(take_k)
+                room -= len(take_k)
+                take_v = visuals[v : v + room] if room > 0 else []
+                v += len(take_v)
+                if not take_k and not take_v:
+                    break
+                piece = dict(scenario)
+                piece["kpis"], piece["visuals"] = take_k, take_v
+                current.append(piece)
+                used += len(take_k) + len(take_v)
+
+        if current:
+            batches.append(current)
+        return batches or [scenarios]
+
+    @staticmethod
+    def _salvage_items(content: str) -> list[dict]:
+        """Recover complete plan objects from truncated or prose-wrapped JSON.
+
+        A cut-off response still contains many valid ``{...}`` items; returning
+        those beats discarding an expensive call entirely.
+        """
+        import json as _json
+
+        keys = {"generated_sql", "sql", "kpi_name"}
+        found: list[dict] = []
+        stack: list[int] = []
+        in_str = esc = False
+        for i, ch in enumerate(content or ""):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                stack.append(i)
+            elif ch == "}" and stack:
+                start = stack.pop()
+                try:
+                    obj = _json.loads(content[start : i + 1])
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(obj, dict) and (keys & obj.keys()):
+                    found.append(obj)
+        return found
+
+    @classmethod
+    def _parse(cls, content: str, scenarios: list[dict]) -> list[ValidationPlanItem]:
         data = extract_json(content)
         if isinstance(data, dict):
             data = data.get("validation_plan", data.get("plan", data.get("items")))
-        if not isinstance(data, list):
+        if not isinstance(data, list) or not data:
+            data = cls._salvage_items(content)
+            if data:
+                _logger.warning(
+                    "Recovered %d plan item(s) from a partial response.", len(data)
+                )
+        if not isinstance(data, list) or not data:
+            snippet = " ".join((content or "").split())[:180] or "(empty response)"
             raise LLMResponseError(
-                "The LLM did not return a JSON validation plan (array of items)."
+                "The LLM did not return a usable validation plan. This is usually a "
+                "truncated response — raise 'Max tokens' or use a larger model. "
+                f"Model said: {snippet}"
             )
 
         # (scenario_id, kpi_name) -> displayed value, so each item is linked to

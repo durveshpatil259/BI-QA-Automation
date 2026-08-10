@@ -23,6 +23,7 @@ from src.domain.models import (
 )
 from src.services.datasources import create_connector
 from src.services.validation import compare_display_values, compare_values, parse_value
+from src.services.validation.identifier_guard import check_identifiers
 from src.services.validation.sql_guard import is_read_only
 from src.storage.project_repository import ProjectRepository
 
@@ -55,8 +56,12 @@ class SqlValidationEngine:
         if config is None or not config.is_configured:
             raise ValidationError("No datasource configured.")
 
-        excel = config.type == DatasourceType.EXCEL
+        # File-based datasources have no SQL engine to execute against.
+        excel = config.type in (DatasourceType.EXCEL, DatasourceType.CSV)
         connector = None if excel else create_connector(config)
+        # Read once: every generated query is checked against it before it
+        # reaches the database.
+        db_schema = self._repo.load_db_schema(project)
 
         run = DataValidationRun()
         for i, item in enumerate(plan.items, start=1):
@@ -70,7 +75,8 @@ class SqlValidationEngine:
                 )
             else:
                 run.results.append(
-                    self._validate_item(f"QA_{i:03d}", item, connector, tolerance_pct, excel)
+                    self._validate_item(f"QA_{i:03d}", item, connector,
+                                        tolerance_pct, excel, db_schema)
                 )
 
         # DAX-driven checks: when there is no screenshot value, a measure defined
@@ -82,7 +88,8 @@ class SqlValidationEngine:
         return run
 
     def _validate_item(
-        self, test_id, item: ValidationPlanItem, connector, tolerance_pct, excel
+        self, test_id, item: ValidationPlanItem, connector, tolerance_pct, excel,
+        db_schema=None,
     ) -> SqlValidationResult:
         dashboard_numeric, _ = parse_value(item.dashboard_value)
         result = SqlValidationResult(
@@ -100,12 +107,23 @@ class SqlValidationEngine:
         if excel:
             result.execution_status = "error"
             result.status = TestStatus.FAIL
-            result.reason = "SQL execution is not supported for an Excel datasource."
+            result.reason = (
+                "SQL execution is not supported for a file datasource "
+                "(Excel/CSV). Use SQL Server to validate generated queries."
+            )
             return result
         if not item.generated_sql or not is_read_only(item.generated_sql):
             result.execution_status = "error"
             result.status = TestStatus.FAIL
             result.reason = "Generated SQL is missing or not a single read-only SELECT."
+            return result
+
+        # The model never saw the data, so verify it did not invent names.
+        check = check_identifiers(item.generated_sql, db_schema)
+        if not check.ok:
+            result.execution_status = "error"
+            result.status = TestStatus.FAIL
+            result.reason = check.reason
             return result
 
         # Execute (Python), timed.
