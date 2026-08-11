@@ -15,10 +15,25 @@ from __future__ import annotations
 import re
 import time
 
-from src.core import cancellation
+from src.core import cancellation, usage
 from src.core.exceptions import LLMConfigError, LLMProviderError, LLMResponseError
 from src.core.logger import get_logger
 from src.services.llm.base import LLMClient, LLMMessage, LLMResponse
+from src.services.llm.rate_limiter import TokenRateLimiter
+
+#: One budget for the whole process — concurrent runs share the same quota.
+_PACER: TokenRateLimiter | None = None
+
+
+def _pacer() -> TokenRateLimiter:
+    global _PACER
+    if _PACER is None:
+        from src.core.config import load_config
+
+        _PACER = TokenRateLimiter(
+            getattr(load_config(), "llm_tokens_per_minute", 12000)
+        )
+    return _PACER
 
 _logger = get_logger()
 
@@ -323,7 +338,18 @@ class OpenAICompatibleClient(LLMClient):
             "Calling %s model=%s max_tokens=%s",
             self.settings.provider, self.model, payload["max_tokens"],
         )
-        return self._parse_response(self._post(payload))
+        # Providers bill prompt + max_tokens against the per-minute cap, and
+        # charge rejected requests too — so wait for room rather than burst.
+        _pacer().acquire(self._estimate_tokens(payload))
+        response = self._parse_response(self._post(payload))
+        usage.record(response.model or self.model, response.usage)
+        return response
+
+    @staticmethod
+    def _estimate_tokens(payload: dict) -> int:
+        """Prompt + reservation, the same sum the provider meters. ~4 chars/token."""
+        chars = sum(len(m.get("content") or "") for m in payload.get("messages", []))
+        return chars // 4 + int(payload.get("max_tokens") or 0)
 
     # --- vision (multimodal chat completions) -----------------------------
     @staticmethod

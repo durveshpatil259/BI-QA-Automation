@@ -189,6 +189,11 @@ PLAN_SYSTEM_PROMPT = (
     "     11.2%    -> CONCAT(ROUND(100.0*SUM(a)/NULLIF(SUM(b),0), 1), '%')\n"
     "     24K      -> CONCAT(ROUND(COUNT(DISTINCT x)/1000.0, 0), 'K')\n"
     "     $2,206   -> CONCAT('$', FORMAT(ROUND(AVG(x), 0), 'N0'))\n"
+    "   PERCENTAGES — never do both. The '%' format code ALREADY multiplies by "
+    "100, so multiplying as well scales the answer by 10,000:\n"
+    "     WRONG: FORMAT(100.0 * a / b, '0.0%')   -> 0.6 renders as 6000.0%\n"
+    "     RIGHT: FORMAT(a / NULLIF(b, 0), '0.0%')\n"
+    "     RIGHT: CONCAT(ROUND(100.0 * a / NULLIF(b, 0), 1), '%')\n"
     "   Return exactly ONE column containing that formatted value.\n"
     "   If no displayed value is given, use the FORMAT guidance instead — it is the "
     "measure's Power BI format string, so following it reproduces exactly how the "
@@ -254,7 +259,10 @@ PLAN_SYSTEM_PROMPT = (
 )
 
 
-def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
+def build_plan_user_prompt(
+    scenarios, schema_text: str, dialect: str, table_map: str = "",
+    calculated_columns: str = "",
+) -> str:
     """Build the mapping prompt from one or more filter scenarios.
 
     ``scenarios`` is a list of dicts::
@@ -315,6 +323,22 @@ def build_plan_user_prompt(scenarios, schema_text: str, dialect: str) -> str:
         lines.append("")
 
     lines += ["DATABASE SCHEMA:", schema_text or "(no schema provided)", ""]
+    # Placed after the schema so it is the last thing read before the task:
+    # which physical table backs each model table is settled by Python, not
+    # inferred from name similarity.
+    if table_map:
+        lines += [table_map, ""]
+    # A measure like SUM(Sales[Profit]) is unreadable without knowing what the
+    # Profit *column* is. Left unstated, the model invents a plausible formula
+    # (Sales Amount - Total Product Cost) that is not what the dashboard does.
+    if calculated_columns:
+        lines += [
+            "CALCULATED COLUMNS — these are computed inside the model, so the "
+            "database has no such column. Expand the formula inline in SQL "
+            "instead of selecting the column by name:",
+            calculated_columns,
+            "",
+        ]
     lines.append(
         "Produce the STRICT JSON validation_plan now — one item per (scenario, KPI) "
         "AND one item per (scenario, chart/table/matrix). JOIN to the tables holding "

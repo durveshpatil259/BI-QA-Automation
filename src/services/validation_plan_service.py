@@ -30,6 +30,9 @@ from src.storage.project_repository import ProjectRepository
 
 _logger = get_logger()
 
+#: Hidden date tables Power BI auto-creates per date column. Model-only.
+_AUTO_DATE_PREFIXES = ("LocalDateTable_", "DateTableTemplate_")
+
 _DIALECTS = {
     DatasourceType.SQL_SERVER: "Microsoft SQL Server (T-SQL)",
     DatasourceType.EXCEL: "ANSI SQL (Excel workbook — treat each sheet as a table)",
@@ -406,6 +409,43 @@ class ValidationPlanService:
         # Identifiers only unless the operator has explicitly opted in.
         allow_samples = bool(getattr(load_config(), 'send_sample_values_to_llm', False))
         schema_text = schema.compact_text(wanted=wanted, include_samples=allow_samples)
+
+        # Resolve model table -> warehouse table deterministically. Left to the
+        # AI, an exactly-named but unrelated table (SalesLT.Customer) beats the
+        # real one (dbo.customer_data) and every value comparison then fails.
+        from src.services.validation.table_matcher import (
+            format_table_map,
+            map_model_tables,
+        )
+
+        # Calculated columns exist only in the model. Without their formulas a
+        # measure such as SUM(Sales[Profit]) cannot be translated faithfully.
+        calc_columns = ""
+        if model_meta:
+            calc_lines = []
+            for table in model_meta.tables:
+                # Power BI's hidden per-column date tables contribute ~19
+                # Year/Month/Quarter formulas that no query will ever need —
+                # pure token cost, and they crowd out the ones that matter.
+                if table.name.startswith(_AUTO_DATE_PREFIXES):
+                    continue
+                for column in table.columns:
+                    if column.is_calculated and column.dax_expression:
+                        calc_lines.append(
+                            f"  {table.name}[{column.name}] = {column.dax_expression}"
+                        )
+            calc_columns = "\n".join(calc_lines[:40])
+
+        table_map = ""
+        if model_meta:
+            resolved = map_model_tables(model_meta, schema)
+            table_map = format_table_map(resolved)
+            for m in resolved:
+                if m.candidates > 1:
+                    _logger.info(
+                        "Table map: %s -> %s (%d shared columns, %d candidates)",
+                        m.model_table, m.db_table, m.shared_columns, m.candidates,
+                    )
         _logger.info(
             "Schema prompt: %d of %d tables, ~%d chars",
             len(schema.relevant_tables(wanted)), len(schema.tables), len(schema_text),
@@ -430,7 +470,9 @@ class ValidationPlanService:
                     len(sc.get('kpis', [])) + len(sc.get('visuals', [])) for sc in batch
                 ) or batch_size
                 response = client.complete(
-                    system, build_plan_user_prompt(batch, schema_text, dialect),
+                    system,
+                    build_plan_user_prompt(batch, schema_text, dialect, table_map,
+                                           calc_columns),
                     # A generated SELECT is ~60-90 tokens; 300 each reserved
                     # three times what any query has ever used, and providers
                     # bill the reservation whether or not it is consumed.
@@ -471,7 +513,12 @@ class ValidationPlanService:
             provider=settings.provider,
             model=model_name,
             raw_response="\n\n".join(raw_parts),
+            batches_total=len(batches),
+            batches_ok=len(raw_parts),
+            errors=errors,
         )
+        if not plan.is_complete:
+            _logger.warning("Validation plan INCOMPLETE: %s", plan.coverage_note())
         self._repo.save_validation_plan(project, plan)
         _logger.info(
             "Validation plan for %s: %d item(s) from %d batch(es); %d batch error(s)",

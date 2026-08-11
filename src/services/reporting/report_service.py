@@ -20,7 +20,9 @@ class ReportService:
     def __init__(self, repository: ProjectRepository):
         self._repo = repository
 
-    def build_report(self, project: Project) -> AnalysisReport:
+    def build_report(
+        self, project: Project, token_usage: dict | None = None
+    ) -> AnalysisReport:
         """Combine context + AI reasoning + test cases into a saved report."""
         context = self._repo.load_analysis_context(project)
         if context is None:
@@ -49,6 +51,7 @@ class ReportService:
             comparisons=context.comparisons,
             sql_validations=data_validation.results if data_validation else [],
             data_validation_summary=data_validation.summary() if data_validation else {},
+            token_usage=token_usage or {},
         )
         self._repo.save_report(project, report)
 

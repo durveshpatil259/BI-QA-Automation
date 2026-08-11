@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 
+from src.core.usage import UsageAccumulator
 from src.domain.models import (
     AnalysisContext,
     AnalysisReport,
@@ -46,6 +47,9 @@ class PipelineContext:
 
     #: Non-fatal problems worth surfacing to the user (degraded stages).
     warnings: list[str] = field(default_factory=list)
+
+    #: Tokens consumed by this run, broken down by stage.
+    usage: UsageAccumulator = field(default_factory=UsageAccumulator, repr=False)
 
     # --- cooperative cancellation ----------------------------------------
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)

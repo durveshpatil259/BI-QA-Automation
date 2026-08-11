@@ -60,6 +60,12 @@ class AppConfig:
     #   max_items_per_call - queries requested per LLM round-trip
     max_scenarios: int = 10
     max_items_per_call: int = 10
+
+    # Client-side pacing against the provider's tokens-per-minute cap. A batch
+    # costs ~5,400 tokens, so only two fit Groq's free-tier 12,000 TPM window;
+    # sending nine at once got most of them rejected *and* still charged them
+    # against the daily quota. 0 disables pacing (paid tiers, local models).
+    llm_tokens_per_minute: int = 12000
     # Optional machine-level default API keys per provider. Per-project
     # settings always take precedence over these.
     default_api_keys: dict[str, str] = field(default_factory=dict)

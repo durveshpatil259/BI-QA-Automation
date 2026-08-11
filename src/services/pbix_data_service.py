@@ -268,7 +268,10 @@ class PbixDataService:
                 if name in values:
                     continue
                 expr = " ".join((measure.dax_expression or "").split())
-                result = self._eval_derived(expr, values, lookup)
+                result = self._eval_derived(
+                    expr, values, lookup,
+                    agg=lambda e: self._eval_aggregate(model, e, table_cache, get_table),
+                )
                 if result is not None:
                     values[name] = MeasureValue(name, result, "derived", expr)
                     progressed = True
@@ -310,22 +313,60 @@ class PbixDataService:
         return None
 
     @staticmethod
-    def _eval_derived(expr: str, values: dict, lookup: dict) -> float | None:
-        def resolve(ref: str) -> float | None:
-            key = lookup.get(ref.strip().casefold())
-            found = values.get(key) if key else None
-            return found.value if found else None
+    def _split_args(inner: str) -> list[str]:
+        """Split a DAX argument list on top-level commas only."""
+        args, depth, current = [], 0, []
+        for char in inner:
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth -= 1
+            if char == "," and depth == 0:
+                args.append("".join(current).strip())
+                current = []
+                continue
+            current.append(char)
+        if current:
+            args.append("".join(current).strip())
+        return args
 
-        match = _DIVIDE.match(expr)
-        if match:
-            left, right = resolve(match.group(1)), resolve(match.group(2))
-            if left is None or right is None:
-                return None
-            return None if right == 0 else left / right
+    def _eval_derived(
+        self, expr: str, values: dict, lookup: dict, agg=None
+    ) -> float | None:
+        def resolve(ref: str) -> float | None:
+            """A measure reference, or an aggregate written inline."""
+            text = ref.strip()
+            bare = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+            key = lookup.get(bare.strip().casefold())
+            found = values.get(key) if key else None
+            if found is not None:
+                return found.value
+            # Real models mix the two forms, e.g.
+            #   DIVIDE([Total Sales Amount], DISTINCTCOUNT('Date'[Date]))
+            # Requiring a measure reference on both sides left four such
+            # measures unevaluated, so their KPIs were never validated.
+            return agg(text) if agg else None
+
+        if expr.upper().startswith("DIVIDE(") and expr.endswith(")"):
+            args = self._split_args(expr[len("DIVIDE("):-1])
+            if len(args) >= 2:
+                left, right = resolve(args[0]), resolve(args[1])
+                if left is None or right is None:
+                    return None
+                if right == 0:
+                    # DIVIDE's third argument is the divide-by-zero result.
+                    if len(args) > 2:
+                        try:
+                            return float(args[2])
+                        except ValueError:
+                            return None
+                    return None
+                return left / right
 
         match = _BINARY.match(expr)
         if match:
-            left, op, right = resolve(match.group(1)), match.group(2), resolve(match.group(3))
+            left, op, right = (resolve(match.group(1)), match.group(2),
+                               resolve(match.group(3)))
             if left is None or right is None:
                 return None
             if op == "-":

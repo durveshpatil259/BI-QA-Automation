@@ -69,6 +69,36 @@ _TEMPLATE = """<!doctype html>
     <div class="card"><div class="n">{{ report.test_cases|length }}</div><div class="l">Test cases</div></div>
   </div>
 
+  {% if tu and tu.total_tokens %}
+  <h2>AI token usage</h2>
+  <div class="cards">
+    <div class="card"><div class="n">{{ '{:,}'.format(tu.total_tokens) }}</div><div class="l">Total tokens</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(tu.prompt_tokens) }}</div><div class="l">Prompt</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(tu.completion_tokens) }}</div><div class="l">Completion</div></div>
+    <div class="card"><div class="n">{{ tu.total_calls }}</div><div class="l">API calls</div></div>
+  </div>
+  <table>
+    <thead><tr><th>Stage</th><th>Calls</th><th>Prompt</th><th>Completion</th><th>Total</th><th>Share</th></tr></thead>
+    <tbody>
+      {% for s in tu.by_stage %}
+      <tr>
+        <td>{{ s.stage }}</td>
+        <td>{{ s.calls }}</td>
+        <td>{{ '{:,}'.format(s.prompt_tokens) }}</td>
+        <td>{{ '{:,}'.format(s.completion_tokens) }}</td>
+        <td><b>{{ '{:,}'.format(s.total_tokens) }}</b></td>
+        <td>{{ '%.0f'|format(100 * s.total_tokens / tu.total_tokens) }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">
+    Providers meter prompt + reserved output tokens against both per-minute and
+    per-day quotas{% if tu.models %} · model{{ 's' if tu.models|length > 1 }}:
+    {{ tu.models|join(', ') }}{% endif %}.
+  </p>
+  {% endif %}
+
   <h2>Executive summary</h2>
   <div class="pre">{{ report.executive_summary or 'Not generated.' }}</div>
 
@@ -189,6 +219,7 @@ def render_html(report: AnalysisReport) -> str:
         report=report,
         vs=report.validation_summary or {"total": 0, "passed": 0, "failed": 0, "critical": 0},
         dvs=report.data_validation_summary or {},
+        tu=report.token_usage or {},
         findings=findings,
         sev_class=_sev_class,
         status_class=_status_class,

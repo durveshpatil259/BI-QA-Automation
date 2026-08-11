@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core import cancellation
+from src.core import cancellation, usage
 from src.core.exceptions import BITestPilotError, OperationCancelled
 from src.core.logger import get_logger
 from src.domain.models import LLMSettings
@@ -73,7 +73,8 @@ class PipelineRunner:
 
         # Publish the token so the LLM back-off and per-item loops inside the
         # services can abort mid-stage, not just at these stage boundaries.
-        with cancellation.use_token(cancellation.CancelToken(ctx.cancel_event)):
+        with cancellation.use_token(cancellation.CancelToken(ctx.cancel_event)), \
+                usage.use_collector(ctx.usage):
             self._run_stages(ctx, reporter, handlers)
         return ctx
 
@@ -85,7 +86,9 @@ class PipelineRunner:
 
             reporter.emit(stage, index, "running")
             try:
-                message = handlers[stage](ctx) or stage.value
+                # Attribute any LLM calls this stage makes to the stage itself.
+                with ctx.usage.stage(stage.value):
+                    message = handlers[stage](ctx) or stage.value
                 reporter.emit(stage, index, "done", message)
                 _logger.info("stage=%s status=done | %s", stage.name, message)
             except OperationCancelled:
@@ -154,6 +157,16 @@ class PipelineRunner:
         ctx.validation_plan = self._s.validation_plan_service.generate(
             ctx.project, settings
         )
+        # A partial plan silently shrinks the whole report, so it must reach the
+        # user as a warning rather than just a smaller number of validations.
+        note = getattr(ctx.validation_plan, "coverage_note", lambda: "")()
+        if note:
+            ctx.warn(note)
+            return (
+                f"{len(ctx.validation_plan.items)} query/queries generated "
+                f"({ctx.validation_plan.batches_ok}/"
+                f"{ctx.validation_plan.batches_total} batches OK — INCOMPLETE)"
+            )
         return f"{len(ctx.validation_plan.items)} query/queries generated"
 
     def _execute_sql(self, ctx: PipelineContext) -> str:
@@ -168,8 +181,12 @@ class PipelineRunner:
         return f"{len(ctx.test_cases)} test case(s)"
 
     def _build_report(self, ctx: PipelineContext) -> str:
-        ctx.report = self._s.report_service.build_report(ctx.project)
-        return f"Report {ctx.report.id}"
+        ctx.report = self._s.report_service.build_report(
+            ctx.project, token_usage=ctx.usage.to_dict()
+        )
+        total = ctx.usage.total_tokens
+        suffix = f" · {total:,} tokens across {ctx.usage.total_calls} call(s)" if total else ""
+        return f"Report {ctx.report.id}{suffix}"
 
     # --- helpers ----------------------------------------------------------
     def _settings(self, ctx: PipelineContext) -> LLMSettings:

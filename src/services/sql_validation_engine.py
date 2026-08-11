@@ -25,7 +25,7 @@ from src.domain.models import (
 from src.services.datasources import create_connector
 from src.services.validation import compare_display_values, compare_values, parse_value
 from src.services.validation.identifier_guard import check_identifiers
-from src.services.validation.sql_guard import is_read_only
+from src.services.validation.sql_guard import double_percent_scaling, is_read_only
 from src.storage.project_repository import ProjectRepository
 
 _logger = get_logger()
@@ -70,11 +70,13 @@ class SqlValidationEngine:
             cancellation.raise_if_cancelled()
             if item.item_type == "grouped":
                 run.results.extend(
-                    self._validate_grouped(f"CH_{i:03d}", item, connector, tolerance_pct, excel)
+                    self._validate_grouped(f"CH_{i:03d}", item, connector,
+                                           tolerance_pct, excel, db_schema)
                 )
             elif item.item_type == "structural":
                 run.results.append(
-                    self._validate_structural(f"ST_{i:03d}", item, connector, excel)
+                    self._validate_structural(f"ST_{i:03d}", item, connector,
+                                              excel, db_schema)
                 )
             else:
                 run.results.append(
@@ -122,12 +124,9 @@ class SqlValidationEngine:
             return result
 
         # The model never saw the data, so verify it did not invent names.
-        check = check_identifiers(item.generated_sql, db_schema)
-        if not check.ok:
-            result.execution_status = "error"
-            result.status = TestStatus.FAIL
-            result.reason = check.reason
-            return result
+        guard = self._guard(item, db_schema, result)
+        if guard is not None:
+            return guard
 
         # Execute (Python), timed.
         t0 = time.perf_counter()
@@ -170,6 +169,19 @@ class SqlValidationEngine:
                 )
             return result
 
+        # An empty/NULL scalar is a matched-no-rows query, not an unparseable
+        # number. Saying "could not parse" sent people looking at the comparison
+        # logic when the real answer is that the WHERE clause excluded everything.
+        if result.database_value.strip().lower() in ("", "none", "null"):
+            result.status = TestStatus.FAIL
+            result.match_type = "no-rows"
+            result.reason = (
+                "Query ran but matched no rows (returned NULL), so there is "
+                f"nothing to compare with the dashboard's {item.dashboard_value}. "
+                "Usually the filter values or the joined table are wrong."
+            )
+            return result
+
         outcome = compare_display_values(
             item.dashboard_value, result.database_value, tolerance_pct=tolerance_pct
         )
@@ -194,14 +206,48 @@ class SqlValidationEngine:
             return None, elapsed, f"SQL execution error: {qr.error}"
         return qr.sample_rows or [], elapsed, None
 
+    def _guard(self, item, db_schema, result) -> SqlValidationResult | None:
+        """Reject SQL naming tables/columns the schema does not have.
+
+        Charts used to skip this check, so a hallucinated table (SalesLT.Reseller)
+        reached the database and came back as a raw ODBC 42S02 error.
+        """
+        if double_percent_scaling(item.generated_sql):
+            result.execution_status = "error"
+            result.status = TestStatus.FAIL
+            result.reason = (
+                "Generated SQL multiplies by 100 and also uses a '%' format "
+                "code, which scales the result by 10,000. Rejected before "
+                "execution because it would return a wrong number, not an error."
+            )
+            return result
+        if db_schema is None:
+            return None
+        check = check_identifiers(item.generated_sql, db_schema)
+        if check.ok:
+            return None
+        result.execution_status = "error"
+        result.status = TestStatus.FAIL
+        result.reason = check.reason
+        return result
+
     def _validate_grouped(
-        self, base_id, item: ValidationPlanItem, connector, tolerance_pct, excel
+        self, base_id, item: ValidationPlanItem, connector, tolerance_pct, excel,
+        db_schema=None,
     ) -> list[SqlValidationResult]:
         """Compare each category's displayed value against its database value.
 
         The query returns (dimension, value) rows; each dashboard data point
         becomes its own PASS/FAIL row so a single wrong bar is pinpointed.
         """
+        blocked = self._guard(item, db_schema, SqlValidationResult(
+            test_id=base_id, kpi_name=item.visual_title or item.kpi_name,
+            visual_title=item.visual_title, scenario=item.scenario,
+            generated_sql=item.generated_sql, confidence=item.confidence,
+            match_type="chart-grouped",
+        ))
+        if blocked is not None:
+            return [blocked]
         rows, elapsed, error = self._run_multirow(item, connector, excel)
         if error:
             return [SqlValidationResult(
@@ -311,7 +357,7 @@ class SqlValidationEngine:
         return results
 
     def _validate_structural(
-        self, test_id, item: ValidationPlanItem, connector, excel
+        self, test_id, item: ValidationPlanItem, connector, excel, db_schema=None
     ) -> SqlValidationResult:
         """Compare the chart's category SET against the database.
 
@@ -324,6 +370,9 @@ class SqlValidationEngine:
             generated_sql=item.generated_sql, confidence=item.confidence,
             match_type="chart-structural",
         )
+        guard = self._guard(item, db_schema, result)
+        if guard is not None:
+            return guard
         rows, elapsed, error = self._run_multirow(item, connector, excel)
         result.execution_time_ms = elapsed
         if error:

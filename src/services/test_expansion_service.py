@@ -29,6 +29,76 @@ from src.storage.project_repository import ProjectRepository
 
 _logger = get_logger()
 
+
+class _Evidence:
+    """Executed SQL validations for one KPI or chart, split by what they prove.
+
+    A template test may only inherit a verdict when the SQL run actually
+    exercised its assertion. "Value Validation" is proven by a scalar
+    comparison; "Refresh Validation" is not proven by anything we can run, so
+    it stays NOT_EXECUTED rather than being marked passed on adjacency.
+    """
+
+    #: A scenario label meaning "no slicer applied".
+    _BASELINE = ("all data", "model measures", "")
+
+    def __init__(self) -> None:
+        self.baseline: list = []
+        self.filtered: list = []
+        self.chart: list = []
+
+    def add(self, result) -> None:
+        if (result.match_type or "").startswith("chart"):
+            self.chart.append(result)
+            return
+        label = (result.scenario or "").casefold()
+        if any(label.startswith(b) for b in self._BASELINE if b):
+            self.baseline.append(result)
+        elif not label:
+            self.baseline.append(result)
+        else:
+            self.filtered.append(result)
+
+    @staticmethod
+    def _verdict(results: list) -> tuple[TestStatus, str]:
+        failed = [r for r in results if r.status is TestStatus.FAIL]
+        ids = ", ".join(r.test_id for r in results[:6])
+        more = f" (+{len(results) - 6} more)" if len(results) > 6 else ""
+        if failed:
+            return TestStatus.FAIL, (
+                f"{len(failed)} of {len(results)} executed SQL validation(s) failed: "
+                f"{', '.join(r.test_id for r in failed[:6])}"
+            )
+        return TestStatus.PASS, f"Proven by executed SQL validation(s): {ids}{more}"
+
+    # --- what each template type may inherit ------------------------------
+    def resolve(self, test_type: str):
+        """(status, remark) if the SQL run proves this test, else None."""
+        if test_type == "Value Validation":
+            # A scalar comparison of the KPI against the database is exactly
+            # this assertion.
+            return self._verdict(self.baseline) if self.baseline else None
+
+        if test_type == "Filter Validation":
+            # Each slicer value was validated as its own scenario, so this is
+            # proven only when filtered scenarios actually ran.
+            return self._verdict(self.filtered) if self.filtered else None
+
+        if test_type == "Format Validation":
+            # Only an *exact* match compares the rendered string character for
+            # character. A numeric match proves the number, not the format, so
+            # it must not satisfy a formatting test.
+            exact = [r for r in self.baseline + self.filtered
+                     if (r.match_type or "") == "exact"]
+            return self._verdict(exact) if exact else None
+
+        if test_type == "Chart Validation":
+            return self._verdict(self.chart) if self.chart else None
+
+        # Null/Refresh/Performance/Tooltip/Cross-filter/Export/Binding: nothing
+        # we execute touches these, so they stay manual.
+        return None
+
 # (test_type, scenario, steps, test_data, expected, priority)
 _KPI_QA = [
     ("Value Validation", "Verify KPI '{n}' shows the correct value",
@@ -154,23 +224,29 @@ class TestExpansionService:
         run = self._repo.load_data_validation(project)
 
         cases: list[TestCase] = []
+        # Executed evidence, keyed by KPI / chart name, so a template test can
+        # inherit a real verdict instead of sitting at NOT_EXECUTED beside a
+        # SQL validation that already proved it.
+        evidence = self._index_evidence(run)
 
         # 1) SQL validation tests (executed) — carry Generated SQL + PASS/FAIL.
         cases.extend(self._sql_validation_cases(run))
 
         # 2) KPI tests (QA + Dev)
         for name, value in self._kpis(ext, md):
+            ev = evidence.get(name.casefold())
             cases.extend(self._from_templates(
-                _KPI_QA, TestCaseKind.QA, f"KPI: {name}", name, value))
+                _KPI_QA, TestCaseKind.QA, f"KPI: {name}", name, value, ev))
             cases.extend(self._from_templates(
-                _KPI_DEV, TestCaseKind.UNIT, f"KPI: {name}", name, value))
+                _KPI_DEV, TestCaseKind.UNIT, f"KPI: {name}", name, value, ev))
 
         # 3) Chart tests (QA + Dev)
         for name in self._charts(ext, md):
+            ev = evidence.get(name.casefold())
             cases.extend(self._from_templates(
-                _CHART_QA, TestCaseKind.QA, f"Chart: {name}", name, ""))
+                _CHART_QA, TestCaseKind.QA, f"Chart: {name}", name, "", ev))
             cases.extend(self._from_templates(
-                _CHART_DEV, TestCaseKind.UNIT, f"Chart: {name}", name, ""))
+                _CHART_DEV, TestCaseKind.UNIT, f"Chart: {name}", name, "", ev))
 
         # 4) Filter tests (QA)
         for name in self._filters(ext, md):
@@ -194,17 +270,38 @@ class TestExpansionService:
 
     # --- builders ---------------------------------------------------------
     @staticmethod
-    def _from_templates(templates, kind, module, name, value) -> list[TestCase]:
+    def _index_evidence(run: DataValidationRun | None) -> dict[str, _Evidence]:
+        """Executed validations grouped by the KPI / chart they exercised."""
+        index: dict[str, _Evidence] = {}
+        if not run:
+            return index
+        for result in run.results:
+            key = (result.visual_title or result.kpi_name or "").casefold()
+            if not key:
+                continue
+            index.setdefault(key, _Evidence()).add(result)
+        return index
+
+    @staticmethod
+    def _from_templates(
+        templates, kind, module, name, value, evidence: _Evidence | None = None
+    ) -> list[TestCase]:
         out = []
         for ttype, scenario, steps, tdata, expected, priority in templates:
+            resolved = evidence.resolve(ttype) if evidence else None
+            status, remarks = (
+                resolved if resolved
+                else (TestStatus.NOT_EXECUTED,
+                      "Auto-generated; execute manually or via automation.")
+            )
             out.append(TestCase(
                 kind=kind, module=module,
                 test_scenario=f"[{ttype}] " + scenario.format(n=name, v=value or "—"),
                 test_steps=steps.format(n=name, v=value or "—"),
                 test_data=tdata.format(n=name, v=value or "—"),
                 expected_result=expected.format(n=name, v=value or "—"),
-                status=TestStatus.NOT_EXECUTED, priority=priority,
-                remarks="Auto-generated; execute manually or via automation.",
+                status=status, priority=priority,
+                remarks=remarks,
                 dashboard_value=value or "",
             ))
         return out

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import uuid
+import re
 from dataclasses import dataclass, field
 
 from src.core.constants import (
@@ -407,6 +408,30 @@ class DbTable(SerializableMixin):
         return f"{self.schema}.{self.name}" if self.schema else self.name
 
 
+#: Affixes ETL tools add when landing a dimension/fact table in a warehouse.
+_TABLE_AFFIXES = ("_data", "_dim", "_fact", "_tbl", "_table", "_dimension")
+_TABLE_PREFIXES = ("dim_", "fact_", "tbl_", "stg_")
+
+
+def normalise_table_name(name: str) -> str:
+    """Compare table names across naming conventions.
+
+    ``Sales Territory``, ``Sales_Territory_data`` and ``dim_salesterritory``
+    all collapse to ``salesterritory`` so a model table can be matched to the
+    warehouse table that actually loads it.
+    """
+    bare = (name or "").rsplit(".", 1)[-1].casefold().strip()
+    for affix in _TABLE_AFFIXES:
+        if bare.endswith(affix):
+            bare = bare[: -len(affix)]
+            break
+    for prefix in _TABLE_PREFIXES:
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    return re.sub(r"[^a-z0-9]", "", bare)
+
+
 @dataclass
 class DbSchema(SerializableMixin):
     """Deterministically-read datasource schema. Feeds the AI semantic mapping."""
@@ -436,15 +461,17 @@ class DbSchema(SerializableMixin):
         if not wanted:
             return list(self.tables)
 
-        target = {w.strip().casefold() for w in wanted if w}
+        target = {normalise_table_name(w) for w in wanted if w}
         by_name = {t.full_name.casefold(): t for t in self.tables}
 
-        def bare(name: str) -> str:
-            return name.rsplit(".", 1)[-1].casefold()
-
+        # Warehouses rarely name a table exactly as the model does: a model
+        # table "Customer" is loaded from "customer_data" / "dim_customer".
+        # Matching on the bare name alone kept SalesLT.Customer (an unrelated
+        # sample table that happens to match exactly) and dropped the real
+        # customer_data, so the AI never saw the columns it needed.
         keep = {
             t.full_name.casefold() for t in self.tables
-            if bare(t.full_name) in target or t.name.casefold() in target
+            if normalise_table_name(t.name) in target
         }
         if not keep:
             return list(self.tables)
@@ -675,6 +702,28 @@ class ValidationPlan(SerializableMixin):
     model: str = ""
     raw_response: str = ""
 
+    # Partial generation used to be invisible: if 8 of 9 batches failed the
+    # plan was still saved, the run still "succeeded", and the report simply
+    # showed fewer validations with no hint that most were never generated.
+    batches_total: int = 0
+    batches_ok: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.batches_total == 0 or self.batches_ok == self.batches_total
+
+    def coverage_note(self) -> str:
+        """Human-readable warning when the plan is partial. Empty if complete."""
+        if self.is_complete:
+            return ""
+        failed = self.batches_total - self.batches_ok
+        return (
+            f"{failed} of {self.batches_total} SQL-generation batches failed, so "
+            f"this plan is incomplete — only {len(self.items)} validation(s) were "
+            f"generated. First error: {self.errors[0] if self.errors else 'unknown'}"
+        )
+
 
 @dataclass
 class SqlValidationResult(SerializableMixin):
@@ -817,3 +866,7 @@ class AnalysisReport(SerializableMixin):
     # Data-validation results (dashboard value vs executed SQL).
     sql_validations: list[SqlValidationResult] = field(default_factory=list)
     data_validation_summary: dict[str, int] = field(default_factory=dict)
+
+    # What the run cost, by stage. Free tiers meter tokens per minute AND per
+    # day, so knowing which stage spent them is what makes a run tunable.
+    token_usage: dict = field(default_factory=dict)
