@@ -222,6 +222,14 @@ class ValidationPlanService:
                     measure = measure or ref
                 elif not dimension:
                     dimension = ref
+            # Not every chart plots a *named measure*: binding a raw column
+            # ("Revenue") and letting Power BI aggregate it is just as common.
+            # Matching only declared measures dropped the value field entirely,
+            # leaving the AI to guess what the bars represent.
+            if not measure:
+                measure = next(
+                    (ref for ref in visual.fields if ref != dimension), ""
+                )
             # A visual with no dimension (e.g. a gauge on a single measure) is
             # already covered by that measure's scalar KPI test.
             if not dimension:
