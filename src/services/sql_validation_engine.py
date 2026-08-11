@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 
+from src.core import cancellation
 from src.core.constants import DatasourceType, TestStatus
 from src.core.exceptions import LLMError, ValidationError
 from src.core.logger import get_logger
@@ -65,6 +66,8 @@ class SqlValidationEngine:
 
         run = DataValidationRun()
         for i, item in enumerate(plan.items, start=1):
+            # A plan can hold 200+ queries; stop between them on cancel.
+            cancellation.raise_if_cancelled()
             if item.item_type == "grouped":
                 run.results.extend(
                     self._validate_grouped(f"CH_{i:03d}", item, connector, tolerance_pct, excel)
@@ -445,7 +448,8 @@ class SqlValidationEngine:
         client = create_client(settings)
         try:
             response = client.complete(
-                EXPLAIN_SYSTEM_PROMPT, build_explain_user_prompt(failures)
+                EXPLAIN_SYSTEM_PROMPT, build_explain_user_prompt(failures),
+                max_tokens=200 * len(failures) + 300,
             )
         except LLMError as exc:
             _logger.warning("Failure explanation call failed: %s", exc)

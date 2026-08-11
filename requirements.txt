@@ -1,8 +1,5 @@
 # ---- BI TestPilot AI — Runtime dependencies ----
 
-# UI
-streamlit==1.39.0
-
 # Data / validation
 pandas==2.2.3
 openpyxl==3.1.5            # Excel datasource (.xlsx)
@@ -20,12 +17,6 @@ SQLAlchemy==2.0.36
 # NOTE: the PyPI package literally named "pbi-tools" is an UNRELATED project
 # (a Power BI REST API wrapper). Do not add it here.
 pbixray==0.15.4
-
-# Screenshot / visual processing
-Pillow==10.4.0
-# Optional OCR (also requires the Tesseract binary on the machine). The app
-# extracts image facts without it and degrades gracefully if it is absent.
-# pytesseract==0.3.13
 
 # LLM HTTP calls (provider-agnostic; no vendor SDK lock-in)
 requests==2.32.3

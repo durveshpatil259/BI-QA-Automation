@@ -126,7 +126,12 @@ def test_llm(body: LLMSettingsRequest, c: Container = Depends(container)):
 
     try:
         client = create_client(settings)
-        response = client.complete("You are a test.", "Reply with the word: ready")
+        # Groq bills prompt + max_tokens against the daily quota, so a test
+        # that inherits the user's 10,000 ceiling burns 10% of the free tier
+        # per click. The reply is one word.
+        response = client.complete(
+            "You are a test.", "Reply with the word: ready", max_tokens=5
+        )
     except LLMError as exc:
         return ConnectionTestResponse(ok=False, message=str(exc))
     except Exception as exc:  # noqa: BLE001 - network/provider errors

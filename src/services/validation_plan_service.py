@@ -12,7 +12,8 @@ that every generated statement is read-only before it is stored for execution
 from __future__ import annotations
 
 from src.core.constants import DatasourceType
-from src.core.exceptions import LLMResponseError, ValidationError
+from src.core import cancellation
+from src.core.exceptions import LLMResponseError, OperationCancelled, ValidationError
 from src.core.logger import get_logger
 from src.domain.models import (
     LLMSettings,
@@ -352,6 +353,15 @@ class ValidationPlanService:
                 ]
                 # Add layout-only charts the screenshot did not capture (e.g.
                 # visuals on other pages), matching on title.
+                #
+                # Only on an unfiltered scenario. A chart's field bindings do
+                # not change when a slicer moves, so backfilling every scenario
+                # asked the model to rewrite the same 21 queries once per
+                # slicer value — 210 generated queries instead of 21, for no
+                # extra coverage. Filtered scenarios keep whatever visuals they
+                # were built with.
+                if sc.get("filters"):
+                    continue
                 have = {str(v.get("title", "")).casefold() for v in sc.get("visuals", [])}
                 sc.setdefault("visuals", []).extend(
                     v for v in layout_visuals
@@ -401,6 +411,7 @@ class ValidationPlanService:
             len(schema.relevant_tables(wanted)), len(schema.tables), len(schema_text),
         )
 
+
         # One call per batch: asking for 30+ queries at once reliably overflows
         # the output budget and truncates the JSON mid-object.
         batch_size = int(getattr(load_config(), 'max_items_per_call',
@@ -412,10 +423,21 @@ class ValidationPlanService:
         model_name = client.model
 
         for index, batch in enumerate(batches, start=1):
+            cancellation.raise_if_cancelled()
             try:
+                # ~300 tokens per generated query, plus JSON overhead.
+                items_in_batch = sum(
+                    len(sc.get('kpis', [])) + len(sc.get('visuals', [])) for sc in batch
+                ) or batch_size
                 response = client.complete(
-                    system, build_plan_user_prompt(batch, schema_text, dialect)
+                    system, build_plan_user_prompt(batch, schema_text, dialect),
+                    # A generated SELECT is ~60-90 tokens; 300 each reserved
+                    # three times what any query has ever used, and providers
+                    # bill the reservation whether or not it is consumed.
+                    max_tokens=150 * items_in_batch + 300,
                 )
+            except OperationCancelled:
+                raise  # a user decision, not a batch failure — stop immediately
             except Exception as exc:  # noqa: BLE001 - one batch must not kill all
                 errors.append(f"batch {index}: {exc}")
                 _logger.warning("Plan batch %d/%d failed: %s", index, len(batches), exc)

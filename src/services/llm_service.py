@@ -117,7 +117,11 @@ class LLMService:
         settings = settings or self.load_settings(project)
         client = client or create_client(settings)
 
-        response = client.complete(SYSTEM_PROMPT, build_user_prompt(context))
+        # A summary + RCA + a few recommendations needs ~1.2k tokens, not the
+        # user's full ceiling — unused reservation still bills against quota.
+        response = client.complete(
+            SYSTEM_PROMPT, build_user_prompt(context), max_tokens=1200
+        )
         parsed = self._parse(response.content)
 
         reasoning = AIReasoning(

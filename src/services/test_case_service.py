@@ -54,7 +54,8 @@ class TestCaseService:
         client = client or create_client(settings)
 
         response = client.complete(
-            TESTCASE_SYSTEM_PROMPT, build_testcase_user_prompt(context)
+            TESTCASE_SYSTEM_PROMPT, build_testcase_user_prompt(context),
+            max_tokens=2500,
         )
         raw_cases = self._parse_cases(response.content)
         cases = [self._to_test_case(rc) for rc in raw_cases[:_MAX_CASES]]

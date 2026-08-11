@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import time
 
+from src.core import cancellation
 from src.core.exceptions import LLMConfigError, LLMProviderError, LLMResponseError
 from src.core.logger import get_logger
 from src.services.llm.base import LLMClient, LLMMessage, LLMResponse
@@ -68,12 +69,14 @@ class OpenAICompatibleClient(LLMClient):
         return url
 
     # --- request/response (pure, testable) --------------------------------
-    def _build_payload(self, messages: list[LLMMessage]) -> dict:
+    def _build_payload(
+        self, messages: list[LLMMessage], max_tokens: int | None = None
+    ) -> dict:
         return {
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "temperature": float(self.settings.temperature),
-            "max_tokens": int(self.settings.max_tokens),
+            "max_tokens": self.effective_max_tokens(max_tokens),
         }
 
     def _headers(self) -> dict[str, str]:
@@ -109,6 +112,9 @@ class OpenAICompatibleClient(LLMClient):
         last_detail = ""
 
         for attempt in range(_MAX_RETRIES + 1):
+            # Cheap check before spending another call: a user who cancelled
+            # during the previous back-off should not trigger a fresh request.
+            cancellation.raise_if_cancelled()
             try:
                 resp = requests.post(
                     endpoint, json=payload, headers=self._headers(),
@@ -163,7 +169,9 @@ class OpenAICompatibleClient(LLMClient):
                 self.settings.provider, resp.status_code, delay,
                 attempt + 1, _MAX_RETRIES,
             )
-            time.sleep(delay)
+            # Cancellable: a plain sleep here is what made Cancel take minutes
+            # to take effect (3 retries x 30s, on every batch).
+            cancellation.sleep(delay)
 
         raise LLMProviderError(f"{self.settings.provider}: {last_detail}")
 
@@ -300,7 +308,9 @@ class OpenAICompatibleClient(LLMClient):
         return sorted(ids)
 
     # --- public -----------------------------------------------------------
-    def chat(self, messages: list[LLMMessage]) -> LLMResponse:
+    def chat(
+        self, messages: list[LLMMessage], *, max_tokens: int | None = None
+    ) -> LLMResponse:
         if not self.settings.api_key.strip():
             raise LLMConfigError(
                 f"No API key configured for {self.settings.provider}. "
@@ -308,8 +318,11 @@ class OpenAICompatibleClient(LLMClient):
             )
         if not self.base_url:
             raise LLMConfigError(f"No base URL configured for {self.settings.provider}.")
-        payload = self._build_payload(messages)
-        _logger.info("Calling %s model=%s", self.settings.provider, self.model)
+        payload = self._build_payload(messages, max_tokens)
+        _logger.info(
+            "Calling %s model=%s max_tokens=%s",
+            self.settings.provider, self.model, payload["max_tokens"],
+        )
         return self._parse_response(self._post(payload))
 
     # --- vision (multimodal chat completions) -----------------------------
@@ -332,6 +345,7 @@ class OpenAICompatibleClient(LLMClient):
         images: list[bytes],
         *,
         image_formats: list[str] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         import base64
 
@@ -361,7 +375,7 @@ class OpenAICompatibleClient(LLMClient):
                 {"role": "user", "content": content},
             ],
             "temperature": float(self.settings.temperature),
-            "max_tokens": int(self.settings.max_tokens),
+            "max_tokens": self.effective_max_tokens(max_tokens),
         }
         _logger.info(
             "Calling %s vision model=%s with %d image(s)",

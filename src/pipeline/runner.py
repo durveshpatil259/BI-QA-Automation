@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.exceptions import BITestPilotError
+from src.core import cancellation
+from src.core.exceptions import BITestPilotError, OperationCancelled
 from src.core.logger import get_logger
 from src.domain.models import LLMSettings
 from src.pipeline.context import PipelineContext
@@ -22,8 +23,10 @@ from src.pipeline.stages import STAGE_ORDER, STAGE_POLICY, FailurePolicy, Stage
 _logger = get_logger()
 
 
-class PipelineCancelled(BITestPilotError):
-    """Raised internally when a run is cancelled between stages."""
+#: Cancellation is raised from deep inside services (the LLM back-off), so the
+#: pipeline name is an alias rather than a subclass — ``except PipelineCancelled``
+#: must catch the very same type that ``core.cancellation`` raises.
+PipelineCancelled = OperationCancelled
 
 
 @dataclass
@@ -68,6 +71,13 @@ class PipelineRunner:
             Stage.BUILD_REPORT: self._build_report,
         }
 
+        # Publish the token so the LLM back-off and per-item loops inside the
+        # services can abort mid-stage, not just at these stage boundaries.
+        with cancellation.use_token(cancellation.CancelToken(ctx.cancel_event)):
+            self._run_stages(ctx, reporter, handlers)
+        return ctx
+
+    def _run_stages(self, ctx, reporter, handlers) -> None:
         for index, stage in enumerate(STAGE_ORDER, start=1):
             if ctx.cancelled:
                 reporter.emit(stage, index, "skipped", "Cancelled by user.")
@@ -78,6 +88,11 @@ class PipelineRunner:
                 message = handlers[stage](ctx) or stage.value
                 reporter.emit(stage, index, "done", message)
                 _logger.info("stage=%s status=done | %s", stage.name, message)
+            except OperationCancelled:
+                # A user decision, never a stage failure: no policy applies.
+                reporter.emit(stage, index, "skipped", "Cancelled by user.")
+                _logger.info("stage=%s status=cancelled", stage.name)
+                raise
             except Exception as exc:  # noqa: BLE001 - policy decides what happens
                 policy = STAGE_POLICY[stage]
                 detail = f"{stage.value} failed: {exc}"
@@ -88,8 +103,6 @@ class PipelineRunner:
                     raise
                 ctx.warn(detail)
                 reporter.emit(stage, index, "skipped", detail)
-
-        return ctx
 
     # --- stages -----------------------------------------------------------
     # Each returns a short human message for the progress feed.

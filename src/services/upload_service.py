@@ -87,14 +87,6 @@ class UploadService:
         self._reconcile(project)
         return results
 
-    def save_screenshots(
-        self, project: Project, files: list[tuple[str, bytes]]
-    ) -> list[SaveResult]:
-        paths = self._repo.paths_for(project)
-        results = self._save_all(files, paths.screenshots_dir, SCREENSHOT_EXTENSIONS)
-        self._reconcile(project)
-        return results
-
     def _save_all(
         self, files: list[tuple[str, bytes]], target_dir: Path, allowed: tuple[str, ...]
     ) -> list[SaveResult]:

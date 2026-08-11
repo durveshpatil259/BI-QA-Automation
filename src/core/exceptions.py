@@ -76,3 +76,12 @@ class LLMProviderError(LLMError):
 
 class LLMResponseError(LLMError):
     """Raised when an LLM returns an unusable/unparseable response."""
+
+
+class OperationCancelled(BITestPilotError):
+    """Raised when the user cancels a run.
+
+    Deliberately *not* a subclass of any domain error: a cancellation is a
+    user decision, not a failure, so ``except Exception`` blocks that degrade
+    a stage or skip a batch must re-raise it instead of swallowing it.
+    """

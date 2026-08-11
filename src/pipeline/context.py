@@ -54,6 +54,11 @@ class PipelineContext:
         self._cancel.set()
 
     @property
+    def cancel_event(self) -> threading.Event:
+        """Shared with :mod:`src.core.cancellation` so services can abort too."""
+        return self._cancel
+
+    @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 

@@ -1,8 +1,8 @@
 """Dependency injection for the API.
 
 Builds every service **once** at import time and hands them out via FastAPI
-``Depends``. Deliberately independent of :mod:`src.ui.state` — that module
-imports Streamlit, which must never be pulled into an HTTP server process.
+``Depends``. Deliberately independent of any UI framework: the container
+holds only services, so the API stays the single entry point into the app.
 """
 
 from __future__ import annotations

@@ -386,14 +386,26 @@ $("btn-cancel").addEventListener("click", async () => {
 });
 
 /* ── screen 3: results ───────────────────────────────────── */
+function stopRun(title, icon, cls, detail) {
+  $("run-title").textContent = title;
+  if (detail) {
+    $("stages").insertAdjacentHTML("beforeend",
+      `<li class="${cls}"><span class="ico">${icon}</span><span>${detail}</span></li>`);
+  }
+  $("btn-cancel").textContent = "Back to setup";
+  $("btn-cancel").disabled = false;
+  $("btn-cancel").onclick = () => { show(1); $("btn-analyze").disabled = false; };
+}
+
 async function finishRun(job) {
   if (job.state === "failed") {
-    $("run-title").textContent = "Analysis failed";
-    $("stages").insertAdjacentHTML("beforeend",
-      `<li class="failed"><span class="ico">✕</span><span>${job.error}</span></li>`);
-    $("btn-cancel").textContent = "Back to setup";
-    $("btn-cancel").disabled = false;
-    $("btn-cancel").onclick = () => { show(1); $("btn-analyze").disabled = false; };
+    stopRun("Analysis failed", "✕", "failed", job.error);
+    return;
+  }
+  // Without this a cancelled run fell through to the results screen and
+  // rendered an all-zero scorecard, which reads as a failed analysis.
+  if (job.state === "cancelled") {
+    stopRun("Run cancelled", "○", "skipped", "Stopped at your request.");
     return;
   }
 

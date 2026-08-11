@@ -24,7 +24,7 @@ multi-agent in the MVP. Users bring their own LLM API keys.
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
+python main.py          # http://127.0.0.1:8000  (API docs at /docs)
 ```
 
 The app creates `config/app_config.json` and a `projects/` folder on first run.
@@ -34,7 +34,7 @@ The app creates `config/app_config.json` and a `projects/` folder on first run.
 Layered Clean Architecture — dependencies point inward only:
 
 ```
-UI (Streamlit)  ->  Services  ->  Domain  <-  Storage
+SPA + API      ->  Services  ->  Domain  <-  Storage
                                     ^
                               Core (config, constants, logging, exceptions)
 ```
@@ -45,7 +45,9 @@ UI (Streamlit)  ->  Services  ->  Domain  <-  Storage
 | Domain | `src/domain` | Pure dataclass models + JSON serialization |
 | Storage | `src/storage` | Project-folder persistence (JSON + assets) |
 | Services | `src/services` | Business logic & the deterministic→AI pipeline |
-| UI | `src/ui` | Streamlit pages, components, theme, state |
+| API | `src/api` | FastAPI routers, schemas, DI container |
+| Pipeline | `src/pipeline` | Stage orchestration, jobs, progress (SSE) |
+| UI | `web/` | Single-page app (plain HTML/CSS/JS, no build step) |
 
 ### Project storage layout (per project)
 

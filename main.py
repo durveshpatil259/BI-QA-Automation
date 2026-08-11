@@ -3,8 +3,7 @@
     python main.py            # http://127.0.0.1:8000  (docs at /docs)
     uvicorn src.api.app:app --reload
 
-Runs alongside the existing Streamlit app during migration; neither replaces the
-other until the SPA lands.
+The single entry point: serves both the JSON API and the SPA in ``web/``.
 """
 
 from __future__ import annotations
