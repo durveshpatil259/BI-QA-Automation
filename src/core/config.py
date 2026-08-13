@@ -30,6 +30,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 APP_CONFIG_FILE = CONFIG_DIR / "app_config.json"
 DEFAULT_PROJECTS_DIR = REPO_ROOT / "projects"
+ENV_FILE = REPO_ROOT / ".env"
+
+
+def _load_env_file() -> None:
+    """Read ``.env`` into the environment, once, at import time.
+
+    Keys belong in the environment rather than a JSON file that is easy to
+    commit by accident. A ``.env`` at the repo root is the least-friction way
+    to set them on a developer machine; real deployments set the variables
+    directly. Existing environment variables always win, so a shell export
+    overrides the file.
+    """
+    if not ENV_FILE.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _logger.info("python-dotenv not installed; .env not loaded.")
+        return
+    load_dotenv(ENV_FILE, override=False)
+    _logger.info("Loaded environment from %s", ENV_FILE)
+
+
+_load_env_file()
 
 
 @dataclass

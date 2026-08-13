@@ -9,6 +9,12 @@ numpy==2.1.3
 pyodbc==5.2.0
 SQLAlchemy==2.0.36
 
+# Excel/CSV datasource execution. pandas loads the file, DuckDB runs the
+# aggregation over the DataFrame — real SQL semantics without needing a
+# database server, and without DuckDB's excel extension (which downloads at
+# runtime and is blocked on locked-down machines).
+duckdb==1.1.3
+
 # Power BI parsing
 # PBIP/PBIR/TMDL and the report layout are plain text/JSON — handled with stdlib.
 # pbixray additionally decompresses the *binary* VertiPaq data model inside a

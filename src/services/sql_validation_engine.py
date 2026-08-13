@@ -23,6 +23,7 @@ from src.domain.models import (
     ValidationPlanItem,
 )
 from src.services.datasources import create_connector
+from src.services.execution import SqlServerAdapter
 from src.services.validation import compare_display_values, compare_values, parse_value
 from src.services.validation.identifier_guard import check_identifiers
 from src.services.validation.sql_guard import double_percent_scaling, is_read_only
@@ -41,12 +42,31 @@ class SqlValidationEngine:
         return self._repo.load_data_validation(project)
 
     # --- execution + comparison ------------------------------------------
+    def _adapter_for(self, config: DatasourceConfig, db_schema, project=None):
+        """Pick the execution engine for this datasource.
+
+        File datasources have no SQL engine, so they get an adapter that
+        executes the plan's structured intent directly. Everything else keeps
+        the existing SQL Server path unchanged.
+        """
+        if config.type in (DatasourceType.EXCEL, DatasourceType.CSV):
+            from src.services.execution.file_adapter import build_file_adapter
+
+            # Metadata supplies the relationships a cross-dataset filter needs.
+            # Optional: without a project the adapter still runs, but a filter
+            # that would need a join is reported as unapplied rather than
+            # quietly dropped.
+            metadata = self._repo.load_metadata(project) if project else None
+            return build_file_adapter(config, metadata)
+        return SqlServerAdapter(create_connector(config), db_schema)
+
     def run(
         self,
         project: Project,
         config: DatasourceConfig | None = None,
         *,
         tolerance_pct: float = 1.0,
+        adapter=None,
     ) -> DataValidationRun:
         plan = self._repo.load_validation_plan(project)
         if not plan or not plan.items:
@@ -57,12 +77,13 @@ class SqlValidationEngine:
         if config is None or not config.is_configured:
             raise ValidationError("No datasource configured.")
 
-        # File-based datasources have no SQL engine to execute against.
-        excel = config.type in (DatasourceType.EXCEL, DatasourceType.CSV)
-        connector = None if excel else create_connector(config)
+
         # Read once: every generated query is checked against it before it
         # reaches the database.
         db_schema = self._repo.load_db_schema(project)
+        # The adapter is the only part that varies per datasource; every plan
+        # item, comparison and verdict below is shared across all of them.
+        adapter = adapter or self._adapter_for(config, db_schema, project)
 
         run = DataValidationRun()
         for i, item in enumerate(plan.items, start=1):
@@ -70,18 +91,15 @@ class SqlValidationEngine:
             cancellation.raise_if_cancelled()
             if item.item_type == "grouped":
                 run.results.extend(
-                    self._validate_grouped(f"CH_{i:03d}", item, connector,
-                                           tolerance_pct, excel, db_schema)
+                    self._validate_grouped(f"CH_{i:03d}", item, adapter, tolerance_pct)
                 )
             elif item.item_type == "structural":
                 run.results.append(
-                    self._validate_structural(f"ST_{i:03d}", item, connector,
-                                              excel, db_schema)
+                    self._validate_structural(f"ST_{i:03d}", item, adapter)
                 )
             else:
                 run.results.append(
-                    self._validate_item(f"QA_{i:03d}", item, connector,
-                                        tolerance_pct, excel, db_schema)
+                    self._validate_item(f"QA_{i:03d}", item, adapter, tolerance_pct)
                 )
 
         # DAX-driven checks: when there is no screenshot value, a measure defined
@@ -93,8 +111,7 @@ class SqlValidationEngine:
         return run
 
     def _validate_item(
-        self, test_id, item: ValidationPlanItem, connector, tolerance_pct, excel,
-        db_schema=None,
+        self, test_id, item: ValidationPlanItem, adapter, tolerance_pct,
     ) -> SqlValidationResult:
         dashboard_numeric, _ = parse_value(item.dashboard_value)
         result = SqlValidationResult(
@@ -108,42 +125,19 @@ class SqlValidationEngine:
             confidence=item.confidence,
         )
 
-        # Guard rails before touching the datasource.
-        if excel:
+        # Execution — including every guard — belongs to the adapter, so each
+        # datasource enforces the rules that actually apply to it.
+        outcome = adapter.execute_scalar(item)
+        result.execution_time_ms = outcome.elapsed_ms
+        result.source_evidence = outcome.evidence
+        if not outcome.ok:
             result.execution_status = "error"
             result.status = TestStatus.FAIL
-            result.reason = (
-                "SQL execution is not supported for a file datasource "
-                "(Excel/CSV). Use SQL Server to validate generated queries."
-            )
-            return result
-        if not item.generated_sql or not is_read_only(item.generated_sql):
-            result.execution_status = "error"
-            result.status = TestStatus.FAIL
-            result.reason = "Generated SQL is missing or not a single read-only SELECT."
-            return result
-
-        # The model never saw the data, so verify it did not invent names.
-        guard = self._guard(item, db_schema, result)
-        if guard is not None:
-            return guard
-
-        # Execute (Python), timed.
-        t0 = time.perf_counter()
-        query_result = connector.run_query(item.generated_sql, sample_rows=1)
-        result.execution_time_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-        if query_result.error:
-            result.execution_status = "error"
-            result.status = TestStatus.FAIL
-            result.reason = f"SQL execution error: {query_result.error}"
+            result.reason = outcome.error
             return result
 
         result.execution_status = "ok"
-        db_value = query_result.scalar_value or (
-            query_result.sample_rows[0][0]
-            if query_result.sample_rows and query_result.sample_rows[0] else ""
-        )
+        db_value = outcome.value or ""
         result.database_value = str(db_value)
         result.database_numeric, _ = parse_value(db_value)
 
@@ -193,67 +187,26 @@ class SqlValidationEngine:
         return result
 
     # --- chart / table / matrix validation --------------------------------
-    def _run_multirow(self, item: ValidationPlanItem, connector, excel, max_rows=500):
-        """Execute a chart query, returning (rows, elapsed_ms, error)."""
-        if excel:
-            return None, None, "SQL execution is not supported for an Excel datasource."
-        if not item.generated_sql or not is_read_only(item.generated_sql):
-            return None, None, "Generated SQL is missing or not a single read-only SELECT."
-        t0 = time.perf_counter()
-        qr = connector.run_query(item.generated_sql, sample_rows=max_rows)
-        elapsed = round((time.perf_counter() - t0) * 1000, 2)
-        if qr.error:
-            return None, elapsed, f"SQL execution error: {qr.error}"
-        return qr.sample_rows or [], elapsed, None
-
-    def _guard(self, item, db_schema, result) -> SqlValidationResult | None:
-        """Reject SQL naming tables/columns the schema does not have.
-
-        Charts used to skip this check, so a hallucinated table (SalesLT.Reseller)
-        reached the database and came back as a raw ODBC 42S02 error.
-        """
-        if double_percent_scaling(item.generated_sql):
-            result.execution_status = "error"
-            result.status = TestStatus.FAIL
-            result.reason = (
-                "Generated SQL multiplies by 100 and also uses a '%' format "
-                "code, which scales the result by 10,000. Rejected before "
-                "execution because it would return a wrong number, not an error."
-            )
-            return result
-        if db_schema is None:
-            return None
-        check = check_identifiers(item.generated_sql, db_schema)
-        if check.ok:
-            return None
-        result.execution_status = "error"
-        result.status = TestStatus.FAIL
-        result.reason = check.reason
-        return result
+    def _run_multirow(self, item: ValidationPlanItem, adapter, max_rows=500):
+        """Execute a chart item, returning (rows, elapsed_ms, error, evidence)."""
+        outcome = adapter.execute_grouped(item, max_rows=max_rows)
+        return outcome.rows, outcome.elapsed_ms, outcome.error, outcome.evidence
 
     def _validate_grouped(
-        self, base_id, item: ValidationPlanItem, connector, tolerance_pct, excel,
-        db_schema=None,
+        self, base_id, item: ValidationPlanItem, adapter, tolerance_pct,
     ) -> list[SqlValidationResult]:
         """Compare each category's displayed value against its database value.
 
         The query returns (dimension, value) rows; each dashboard data point
         becomes its own PASS/FAIL row so a single wrong bar is pinpointed.
         """
-        blocked = self._guard(item, db_schema, SqlValidationResult(
-            test_id=base_id, kpi_name=item.visual_title or item.kpi_name,
-            visual_title=item.visual_title, scenario=item.scenario,
-            generated_sql=item.generated_sql, confidence=item.confidence,
-            match_type="chart-grouped",
-        ))
-        if blocked is not None:
-            return [blocked]
-        rows, elapsed, error = self._run_multirow(item, connector, excel)
+        rows, elapsed, error, evidence = self._run_multirow(item, adapter)
         if error:
             return [SqlValidationResult(
                 test_id=base_id, kpi_name=item.visual_title or item.kpi_name,
                 visual_title=item.visual_title, scenario=item.scenario,
                 generated_sql=item.generated_sql, execution_time_ms=elapsed,
+                source_evidence=evidence,
                 execution_status="error", status=TestStatus.FAIL, reason=error,
                 confidence=item.confidence, match_type="chart-grouped",
             )]
@@ -357,7 +310,7 @@ class SqlValidationEngine:
         return results
 
     def _validate_structural(
-        self, test_id, item: ValidationPlanItem, connector, excel, db_schema=None
+        self, test_id, item: ValidationPlanItem, adapter
     ) -> SqlValidationResult:
         """Compare the chart's category SET against the database.
 
@@ -370,11 +323,9 @@ class SqlValidationEngine:
             generated_sql=item.generated_sql, confidence=item.confidence,
             match_type="chart-structural",
         )
-        guard = self._guard(item, db_schema, result)
-        if guard is not None:
-            return guard
-        rows, elapsed, error = self._run_multirow(item, connector, excel)
+        rows, elapsed, error, evidence = self._run_multirow(item, adapter)
         result.execution_time_ms = elapsed
+        result.source_evidence = evidence
         if error:
             result.execution_status = "error"
             result.status = TestStatus.FAIL

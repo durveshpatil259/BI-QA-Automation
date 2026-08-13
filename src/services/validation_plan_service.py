@@ -25,6 +25,7 @@ from src.services.llm import create_client
 from src.services.llm.base import LLMClient
 from src.services.llm.json_utils import extract_json
 from src.services.llm.prompt_builder import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
+from src.services.validation.filter_reach import filter_applies
 from src.services.validation.sql_guard import is_read_only
 from src.storage.project_repository import ProjectRepository
 
@@ -358,8 +359,17 @@ class ValidationPlanService:
             # Attach format guidance to screenshot-derived KPIs too.
             layout_visuals = self._visuals_from_metadata(metadata)
             for sc in scenarios:
+                # A 5th element records whether the scenario's filter can even
+                # reach this KPI. Power BI propagates along relationship
+                # direction only, so a Fiscal Year slicer never reaches a
+                # Customer-table measure — and the SQL must not filter it.
+                filter_table = ""
+                if sc.get("filters"):
+                    first = sc["filters"][0][0]
+                    filter_table = first.split("[", 1)[0].strip().strip("'")
                 sc["kpis"] = [
-                    (k[0], k[1], k[2], fmt_by_name.get(k[0].casefold(), ""))
+                    (k[0], k[1], k[2], fmt_by_name.get(k[0].casefold(), ""),
+                     filter_applies(metadata, filter_table, k[2]) if filter_table else True)
                     for k in sc["kpis"]
                 ]
                 # Add layout-only charts the screenshot did not capture (e.g.
@@ -381,6 +391,81 @@ class ValidationPlanService:
         return scenarios
 
     # --- generation -------------------------------------------------------
+    def _build_plan_without_sql(self, project, scenarios) -> ValidationPlan:
+        """Plan for a file datasource — built entirely in Python.
+
+        Every field the file adapter needs is already known deterministically:
+        the KPI and its rendered value come from the DAX evaluation, the
+        aggregation and column from the measure's own DAX, the dimension from
+        the report layout, and the filters from the scenario. No model is asked
+        to restate any of it, so nothing can be hallucinated and no tokens are
+        spent on SQL that would be thrown away.
+        """
+        metadata = self._repo.load_metadata(project)
+        dax_of = {
+            (m.name or "").casefold(): (m.dax_expression or "")
+            for m in (metadata.all_measures if metadata else [])
+        }
+        items: list[ValidationPlanItem] = []
+
+        for scenario in scenarios:
+            filters = [f"{col} = '{val}'" for col, val in (scenario.get("filters") or [])]
+            for kpi in scenario.get("kpis", []):
+                name, value = kpi[0], kpi[1]
+                dax = " ".join((kpi[2] if len(kpi) > 2 else "").split())                     or " ".join(dax_of.get(name.casefold(), "").split())
+                table, column, aggregation = self._intent_from_dax(dax)
+                items.append(ValidationPlanItem(
+                    kpi_name=name, dashboard_value=value,
+                    table=table, column=column, aggregation=aggregation,
+                    business_meaning=dax, filters=list(filters),
+                    scenario=scenario.get("label", ""), item_type="scalar",
+                    confidence=1.0 if table else 0.0,
+                ))
+            for visual in scenario.get("visuals", []):
+                dimension = str(visual.get("dimension_field") or "")
+                if not dimension:
+                    continue
+                measure_field = str(visual.get("measure_field") or "")
+                measure_name = measure_field.rsplit(".", 1)[-1]
+                dax = " ".join(dax_of.get(measure_name.casefold(), "").split())
+                table, column, aggregation = self._intent_from_dax(dax)
+                items.append(ValidationPlanItem(
+                    kpi_name=measure_name or visual.get("title", ""),
+                    visual_title=visual.get("title", ""),
+                    table=table, column=column, aggregation=aggregation,
+                    dimension_column=dimension, filters=list(filters),
+                    scenario=scenario.get("label", ""),
+                    item_type="grouped" if column else "structural",
+                    confidence=1.0,
+                ))
+
+        plan = ValidationPlan(items=items, provider=None, model="python (no AI)",
+                              raw_response="", batches_total=0, batches_ok=0)
+        self._repo.save_validation_plan(project, plan)
+        _logger.info(
+            "Validation plan for %s: %d item(s) built without AI (file datasource)",
+            project.id, len(items),
+        )
+        return plan
+
+    @staticmethod
+    def _intent_from_dax(dax: str) -> tuple[str, str, str]:
+        """(table, column, aggregation) for a single-aggregate measure.
+
+        Anything more complex returns blanks; the adapter then compiles the DAX
+        itself rather than acting on a half-understood intent.
+        """
+        import re as _re
+
+        match = _re.match(
+            r"^\s*(SUM|AVERAGE|AVG|MIN|MAX|COUNT|COUNTA|DISTINCTCOUNT)\s*\(\s*"
+            r"'?([^'\[\]]+?)'?\s*\[\s*([^\]]+?)\s*\]\s*\)\s*$",
+            dax or "", _re.IGNORECASE)
+        if not match:
+            return "", "", ""
+        function, table, column = match.groups()
+        return table.strip(), column.strip(), function.upper()
+
     def generate(
         self,
         project: Project,
@@ -396,6 +481,14 @@ class ValidationPlanService:
                 "No KPIs or measures to map. Run AI vision extraction (Step 2) or "
                 "extract metadata (Step 1) first."
             )
+
+        # A file datasource executes the plan's structured intent, compiling the
+        # measure's own DAX. Asking the model for SQL would spend the largest
+        # part of the token budget on text that is then discarded — and the
+        # report would show a query that never ran.
+        datasource = self._repo.load_datasource(project)
+        if datasource and datasource.type in (DatasourceType.EXCEL, DatasourceType.CSV):
+            return self._build_plan_without_sql(project, scenarios)
 
         schema = self._repo.load_db_schema(project)
         if not schema or not schema.tables:

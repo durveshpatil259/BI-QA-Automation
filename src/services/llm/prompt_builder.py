@@ -200,6 +200,21 @@ PLAN_SYSTEM_PROMPT = (
     "dashboard renders that KPI.\n"
     "   Measure DAX may reference OTHER measures in [Brackets] (e.g. "
     "[Total Sales] - [Total Cost]). Expand those into their own SQL expressions.\n"
+    "7. AN AGGREGATE OVER A DIMENSION TABLE COUNTS THE WHOLE DIMENSION, not the "
+    "rows that happen to join to the fact table. DISTINCTCOUNT('Date'[Date]) "
+    "means every date in the calendar, including days with no sales. A JOIN "
+    "silently drops those days and inflates any per-day average:\n"
+    "     DAX:   DIVIDE([Total Sales], DISTINCTCOUNT('Date'[Date]))\n"
+    "     WRONG: SELECT SUM(S.[Sales Amount]) / COUNT(DISTINCT D.[Date])\n"
+    "              FROM Sales_data S JOIN date_data D ON S.OrderDateKey = D.DateKey\n"
+    "              -- counts only the 1,081 days that had sales\n"
+    "     RIGHT: SELECT SUM(S.[Sales Amount]) * 1.0 /\n"
+    "              (SELECT COUNT(DISTINCT [Date]) FROM date_data)\n"
+    "              FROM Sales_data S\n"
+    "              -- counts all 1,461 calendar days, as the dashboard does\n"
+    "   Put the dimension aggregate in its own scalar subquery so the join "
+    "cannot filter it. Apply the scenario's filter inside that subquery too "
+    "when the filter is on that same dimension.\n"
     "7. A single read-only SELECT per KPI. No semicolons, no INSERT/UPDATE/DELETE/DDL. "
     "You do NOT execute anything — Python runs it.\n"
     "8. Target dialect: {dialect}. Bracket-quote identifiers containing spaces, e.g. "
@@ -300,6 +315,13 @@ def build_plan_user_prompt(
                 line += f"  | displayed: {value}  (MATCH THIS FORMAT EXACTLY)"
             if dax:
                 line += f"  | DAX: {dax}"
+            # Power BI relationships are directional: a slicer on one dimension
+            # does not reach another dimension across the fact table. Without
+            # this the model filtered every KPI by every slicer.
+            if len(kpi) > 4 and kpi[4] is False:
+                line += ("  | *** THIS KPI IS NOT AFFECTED BY THE ACTIVE FILTER "
+                         "(no relationship path) — DO NOT add a WHERE clause or "
+                         "JOIN for it; return the same unfiltered value ***")
             if fmt:
                 # Power BI format string — authoritative when no screenshot
                 # value exists, so the SQL still returns dashboard-shaped output.

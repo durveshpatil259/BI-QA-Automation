@@ -109,6 +109,7 @@ def get_results(project_id: str, c: Container = Depends(container)):
         ValidationRow(
             test_id=r.test_id, kpi=r.kpi_name, scenario=r.scenario,
             dashboard_value=r.dashboard_value, generated_sql=r.generated_sql,
+            source_evidence=getattr(r, 'source_evidence', ''),
             database_value=r.database_value, difference=r.difference,
             match_type=r.match_type, execution_time_ms=r.execution_time_ms,
             status=str(r.status),

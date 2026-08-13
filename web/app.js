@@ -84,40 +84,16 @@ function refreshAnalyze() {
   $("btn-analyze").disabled = !(state.pbixFile && state.dsReady);
 }
 
-/* ── LLM settings (machine-level, inherited by every run) ── */
-let llmPresets = {};
-
-function llmPayload() {
-  return {
-    provider: $("llm-provider").value,
-    api_key: $("llm-key").value,          // blank keeps the stored key
-    model: $("llm-model").value.trim(),
-    base_url: $("llm-base").value.trim(),
-    temperature: 0.2,
-    max_tokens: Number($("llm-max").value) || 2048,
-  };
-}
+/* ── LLM settings (machine-level, inherited by every run) ──
+   The browser only ever knows provider + model. Endpoint, credentials and
+   token budget are resolved on the server, so no secret exists in this file,
+   in the DOM, or in localStorage. */
 
 //: The last SAVED config. The badge reflects this, not the form, so unsaved
 //  edits can never be mistaken for the settings a run will actually use.
 let savedLlm = null;
 
 function applyLlm(cfg) {
-  llmPresets = cfg.presets || {};
-  const prov = $("llm-provider");
-  if (!prov.options.length) {
-    prov.innerHTML = (cfg.providers || [])
-      .map((p) => `<option>${p}</option>`).join("");
-    $("llm-preset").innerHTML +=
-      Object.keys(llmPresets).map((p) => `<option>${p}</option>`).join("");
-  }
-  prov.value = cfg.provider;
-  $("llm-model").value = cfg.model || "";
-  $("llm-base").value = cfg.base_url || "";
-  $("llm-max").value = cfg.max_tokens || 2048;
-  $("llm-key").value = "";
-  $("llm-key").placeholder = cfg.has_api_key
-    ? "•••• stored — leave blank to keep" : "paste your API key";
   savedLlm = cfg;
   refreshLlmBadge();
   if (!cfg.is_configured) $("llm-card").open = true;
@@ -127,10 +103,7 @@ function llmIsDirty() {
   if (!savedLlm) return false;
   return (
     $("llm-provider").value !== savedLlm.provider ||
-    $("llm-model").value.trim() !== (savedLlm.model || "") ||
-    $("llm-base").value.trim() !== (savedLlm.base_url || "") ||
-    Number($("llm-max").value) !== Number(savedLlm.max_tokens) ||
-    $("llm-key").value.trim() !== ""
+    $("llm-model").value !== (savedLlm.model || "")
   );
 }
 
@@ -147,41 +120,77 @@ function refreshLlmBadge() {
   badge.className = "badge" + (cfg.is_configured ? " ok" : "");
 }
 
-// Any edit immediately marks the badge stale.
-["llm-provider", "llm-model", "llm-base", "llm-max", "llm-key"].forEach((id) =>
-  ["input", "change"].forEach((ev) =>
-    $(id).addEventListener(ev, refreshLlmBadge)));
+["llm-provider", "llm-model"].forEach((id) =>
+  $(id).addEventListener("change", refreshLlmBadge));
 
-async function loadLlm() {
-  const res = await api("/api/settings/llm");
-  if (res.ok) applyLlm(await res.json());
+/* Load the models for a provider and populate the dropdown. Called on load and
+   whenever the provider changes — there is no Fetch button. */
+async function loadModels(provider, preferred) {
+  const sel = $("llm-model");
+  sel.innerHTML = '<option value="">Loading…</option>';
+  sel.disabled = true;
+  try {
+    const res = await api(
+      `/api/settings/llm/providers/${encodeURIComponent(provider)}/models`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || "Could not load models");
+
+    const models = body.models || [];
+    if (!models.length) {
+      sel.innerHTML = '<option value="">No models available</option>';
+      setStatus($("llm-status"),
+        `Unable to load ${provider} models. Check the backend ${provider} configuration.`,
+        "err");
+      return;
+    }
+    sel.innerHTML = models
+      .map((m) => `<option value="${m.id}">${m.label}</option>`).join("");
+    // Keep the saved model when it is still offered; otherwise the default.
+    const wanted = models.some((m) => m.id === preferred) ? preferred : body.default;
+    sel.value = wanted || models[0].id;
+    sel.disabled = false;
+    setStatus($("llm-status"), body.notice || "");
+  } catch (err) {
+    sel.innerHTML = '<option value="">Unavailable</option>';
+    setStatus($("llm-status"), err.message, "err");
+  } finally {
+    sel.disabled = false;
+    refreshLlmBadge();
+  }
 }
 
-$("llm-preset").addEventListener("change", (e) => {
-  const preset = llmPresets[e.target.value];
-  if (!preset) return;
-  // Set the provider too — a preset whose provider disagrees with the dropdown
-  // produced nonsense like "Grok · gemini-3.5-flash".
-  if (preset.provider) $("llm-provider").value = preset.provider;
-  $("llm-base").value = preset.base_url || "";
-  $("llm-model").value = preset.model || "";
-  setStatus($("llm-status"), `Autofilled ${e.target.value}. Add your API key.`);
-});
-
-// Changing the provider clears a base URL that belongs to a different one.
-$("llm-provider").addEventListener("change", () => {
-  const provider = $("llm-provider").value;
-  const match = Object.entries(llmPresets)
-    .find(([, p]) => p.provider === provider);
-  if (match) {
-    $("llm-preset").value = match[0];
-    $("llm-base").value = match[1].base_url || "";
-    if (!$("llm-model").value) $("llm-model").value = match[1].model || "";
+async function loadLlm() {
+  const [provRes, cfgRes] = await Promise.all([
+    api("/api/settings/llm/providers"),
+    api("/api/settings/llm"),
+  ]);
+  if (!provRes.ok || !cfgRes.ok) {
+    setStatus($("llm-status"), "Could not load AI model configuration.", "err");
+    return;
   }
+  const provs = await provRes.json();
+  const cfg = await cfgRes.json();
+
+  // A provider with no server-side key is still selectable, but says so.
+  $("llm-provider").innerHTML = (provs.providers || [])
+    .map((p) => `<option value="${p.id}">${p.label}${p.configured ? "" : " (no key on server)"}</option>`)
+    .join("");
+  $("llm-provider").value = cfg.provider || provs.selected;
+  await loadModels($("llm-provider").value, cfg.model);
+  applyLlm(cfg);
+}
+
+// Changing the provider always reloads that provider's models.
+$("llm-provider").addEventListener("change", async () => {
+  $("llm-model").innerHTML = "";
+  await loadModels($("llm-provider").value, "");
 });
 
-async function postLlm(path, okMsg) {
-  setStatus($("llm-status"), "Working…");
+function llmPayload() {
+  return { provider: $("llm-provider").value, model: $("llm-model").value };
+}
+
+async function postLlm(path) {
   try {
     const res = await api(path, {
       method: "POST",
@@ -194,44 +203,36 @@ async function postLlm(path, okMsg) {
   } catch (err) {
     setStatus($("llm-status"), err.message, "err");
     return null;
-  } finally {
-    if (okMsg) setStatus($("llm-status"), okMsg, "ok");
   }
 }
 
 $("btn-llm-save").addEventListener("click", async () => {
+  if (!$("llm-provider").value) {
+    return setStatus($("llm-status"), "Select an LLM provider.", "err");
+  }
+  if (!$("llm-model").value) {
+    return setStatus($("llm-status"), "Select a model.", "err");
+  }
+  setStatus($("llm-status"), "Saving…");
   const body = await postLlm("/api/settings/llm");
   if (!body) return;
   applyLlm(body);
-  setStatus($("llm-status"), "Saved. Every analysis will use this model.", "ok");
+  setStatus($("llm-status"), "AI model configuration saved successfully.", "ok");
 });
 
 $("btn-llm-test").addEventListener("click", async () => {
+  if (!$("llm-provider").value || !$("llm-model").value) {
+    return setStatus($("llm-status"), "Select a provider and model first.", "err");
+  }
+  setStatus($("llm-status"), "Testing…");
   const body = await postLlm("/api/settings/llm/test");
   if (!body) return;
   // Testing does not persist anything — say so, or a successful test reads
   // as "configured" while runs still use the previously saved provider.
   const suffix = body.ok && llmIsDirty() ? " Now click Save to use it." : "";
-  setStatus($("llm-status"), body.message + suffix, body.ok ? "ok" : "err");
-});
-
-$("btn-llm-models").addEventListener("click", async () => {
-  const body = await postLlm("/api/settings/llm/models");
-  if (!body) return;
-  const models = body.models || [];
-  if (!models.length) {
-    setStatus($("llm-status"), "Provider returned no models.", "err");
-    return;
-  }
-  // Turn the model field into a picker of what this key can actually use.
-  const list = document.createElement("datalist");
-  list.id = "llm-model-list";
-  list.innerHTML = models.map((m) => `<option value="${m}">`).join("");
-  document.getElementById("llm-model-list")?.remove();
-  document.body.appendChild(list);
-  $("llm-model").setAttribute("list", "llm-model-list");
   setStatus($("llm-status"),
-    `${models.length} model(s) available — click the Model field to choose.`, "ok");
+    (body.ok ? "✓ " : "✗ ") + body.message + suffix,
+    body.ok ? "ok" : "err");
 });
 
 /* ── project + uploads ───────────────────────────────────── */
@@ -316,7 +317,8 @@ $("btn-analyze").addEventListener("click", async () => {
     const res = await api(`/api/projects/${pid}/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tolerance_pct: Number($("tolerance").value) || 1 }),
+      // Tolerance is fixed at 1% — the backend default. No longer a UI field.
+      body: JSON.stringify({ tolerance_pct: 1 }),
     });
     const job = await res.json();
     if (!res.ok) throw new Error(job.detail || "Could not start analysis");
@@ -435,14 +437,25 @@ async function loadResults() {
   const data = await res.json();
   const rows = data.rows || [];
   $("results-empty").hidden = rows.length > 0;
+  // A file datasource has no SQL to show; its proof is the sheet, operation
+  // and filters. Relabel the column so the header matches what is in it.
+  const anySql = rows.every((r) => {
+    const e = (r.source_evidence || r.generated_sql || "").trim();
+    return !e || e.toUpperCase().startsWith("SELECT");
+  });
+  $("evidence-head").textContent = anySql ? "Query used to fetch" : "How it was calculated";
+
   $("results-body").innerHTML = rows.map((r) => {
     const k = r.status === "Pass" ? "pass" : r.status === "Fail" ? "fail" : "other";
+    // The adapter that ran sets source_evidence; a plan's generated_sql
+    // survives even when a file datasource never executed it.
+    const evidence = (r.source_evidence || "").trim() || r.generated_sql || "";
     return `<tr>
       <td>${escapeHtml(r.test_id)}</td>
       <td>${escapeHtml(r.kpi)}</td>
       <td>${escapeHtml(r.scenario || "—")}</td>
       <td>${escapeHtml(r.dashboard_value || "—")}</td>
-      <td class="sql" title="${escapeHtml(r.generated_sql || "")}">${escapeHtml(r.generated_sql || "—")}</td>
+      <td class="sql" title="${escapeHtml(evidence)}">${escapeHtml(evidence || "—")}</td>
       <td>${escapeHtml(r.database_value || "—")}</td>
       <td>${escapeHtml(r.difference || "—")}</td>
       <td>${escapeHtml(r.match_type || "—")}</td>

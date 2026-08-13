@@ -72,7 +72,11 @@ def report_xlsx(project_id: str, c: Container = Depends(container)):
 
     validations = pd.DataFrame([{
         "Test ID": r.test_id, "Scenario": r.scenario, "KPI": r.kpi_name,
-        "Dashboard Value": r.dashboard_value, "Generated SQL": r.generated_sql,
+        "Dashboard Value": r.dashboard_value,
+        # Whichever proof the datasource produced: SQL for a database, or
+        # sheet/operation/filters for a spreadsheet.
+        "How it was calculated": getattr(r, "source_evidence", "")
+                                 or (r.generated_sql or "").strip(),
         "Database Value": r.database_value, "Difference": r.difference,
         "Match": r.match_type, "Execution Time (ms)": r.execution_time_ms,
         "Status": str(r.status), "Reason": r.reason,

@@ -145,8 +145,8 @@ def compare_display_values(
             match_type="exact",
         )
 
-    dash_num, _ = parse_value(dashboard_raw)
-    db_num, _ = parse_value(database_raw)
+    dash_num, dash_unit = parse_value(dashboard_raw)
+    db_num, db_unit = parse_value(database_raw)
     outcome = compare_values(dash_num, db_num, tolerance_pct=tolerance_pct)
     if outcome.passed:
         outcome.match_type = "numeric"
@@ -154,6 +154,103 @@ def compare_display_values(
             f"Numeric match within tolerance (display differs: dashboard "
             f"'{dashboard_raw}' vs database '{database_raw}'). " + outcome.reason
         )
+        return outcome
+
+    # A percentage has two conventional representations and the source picks
+    # one of them: a dashboard showing 60.0% is 60 to a query that formats a
+    # percentage, and 0.6 to one that returns the underlying ratio. DAX DIVIDE
+    # yields the ratio, so a correct value was being failed on scale alone.
+    scaled = _compare_percent_scale(
+        dash_num, dash_unit, db_num, db_unit, tolerance_pct
+    )
+    if scaled is not None:
+        return scaled
+
+    rounded = _compare_at_display_precision(
+        dashboard_raw, dash_num, database_raw, db_num, tolerance_pct
+    )
+    if rounded is not None:
+        return rounded
+    return outcome
+
+
+def _decimals_shown(text) -> int | None:
+    """Decimal places in a displayed number, or None if it is not numeric."""
+    digits = re.sub(r"[^0-9.]", "", str(text or ""))
+    if not digits or digits.count(".") > 1:
+        return None
+    return len(digits.split(".")[1]) if "." in digits else 0
+
+
+def _compare_at_display_precision(
+    dashboard_raw, dash_num, database_raw, db_num, tolerance_pct
+) -> "ComparisonOutcome | None":
+    """Retry with the source rounded to the precision the dashboard shows.
+
+    A card displaying ``4`` for 3.5557 is not wrong — it is rounded. Comparing
+    the rendered string against full precision made a correct value fail by
+    12%, which is the dashboard's formatting, not a data defect.
+
+    Only ever *loses* precision from the source, and only when the dashboard
+    genuinely shows fewer decimals, so it cannot rescue a real mismatch.
+    """
+    if dash_num is None or db_num is None:
+        return None
+    dash_places = _decimals_shown(dashboard_raw)
+    db_places = _decimals_shown(database_raw)
+    if dash_places is None or db_places is None or db_places <= dash_places:
+        return None
+
+    if round(db_num, dash_places) != dash_num:
+        return None
+    outcome = compare_values(dash_num, round(db_num, dash_places),
+                             tolerance_pct=tolerance_pct)
+    if not outcome.passed:
+        return None
+    outcome.match_type = "rounded"
+    outcome.reason = (
+        f"Match at the dashboard's displayed precision: it shows "
+        f"'{dashboard_raw}' ({dash_places} dp) and the source returned "
+        f"{db_num:g}, which rounds to the same value. Differences smaller than "
+        f"the displayed precision cannot be detected from a rendered value."
+    )
+    return outcome
+
+
+def _compare_percent_scale(
+    dash_num, dash_unit, db_num, db_unit, tolerance_pct
+) -> "ComparisonOutcome | None":
+    """Retry a percentage comparison with the ratio/percent scales reconciled.
+
+    Only when exactly one side is written as a percentage — if both are, or
+    neither is, there is no scale question to resolve and a 100x adjustment
+    would manufacture a match.
+    """
+    if dash_num is None or db_num is None:
+        return None
+    is_percent = (dash_unit == "%", db_unit == "%")
+    if is_percent[0] == is_percent[1]:
+        return None
+
+    if is_percent[0]:
+        percent_value, plain_value, side = dash_num, db_num, "database"
+    else:
+        percent_value, plain_value, side = db_num, dash_num, "dashboard"
+
+    # A ratio is bounded in practice; without this, 6000 would "match" 60%.
+    if abs(plain_value) > 1.5:
+        return None
+
+    outcome = compare_values(percent_value / 100.0, plain_value,
+                             tolerance_pct=tolerance_pct)
+    if not outcome.passed:
+        return None
+    outcome.match_type = "numeric-percent"
+    outcome.reason = (
+        f"Percentage match once the scales are reconciled: {percent_value}% "
+        f"is the ratio {percent_value / 100.0:g}, which the {side} returned "
+        f"as {plain_value:g}. " + outcome.reason
+    )
     return outcome
 
 

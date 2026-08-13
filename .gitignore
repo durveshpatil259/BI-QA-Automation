@@ -16,3 +16,6 @@ config/app_config.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# API keys — never commit
+.env

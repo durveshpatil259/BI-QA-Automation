@@ -170,12 +170,31 @@ input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--brand) 4
 }
 .badge.ok { background: var(--pass-bg); color: var(--pass); }
 .badge.dirty { background: var(--warn-bg); color: var(--warn); }
-.llm-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+/* Actions sit together at the trailing edge, secondary then primary — the same
+   shape as .downloads on the results screen. Grouping them reads as one
+   decision point, and the left-to-right order matches the workflow: test it,
+   then save it. No divider above: the card border already encloses the group,
+   and a second rule inside a short panel cut it into two smaller ones. */
+.llm-actions { display: flex; justify-content: flex-end; align-items: center;
+               gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+
+/* Feedback tracks the button group that produced it. Selected by id, not
+   class, because setStatus() rebuilds className. Collapsed rather than hidden
+   when empty: it is the card's last child, and `display:none` would take the
+   card's bottom padding with it. */
+#llm-status { text-align: right; margin: 10px 0 0; min-height: 0; }
+#llm-status:empty { margin-top: 0; }
+
+/* One full-width column on narrow screens so neither button gets cramped.
+   Plain `column` keeps DOM order, leaving Save last — nearest the thumb and
+   still the final step, exactly as on desktop. */
+@media (max-width: 520px) {
+  .llm-actions { flex-direction: column; align-items: stretch; }
+  #llm-status { text-align: center; }
+}
 
 .actions { display: flex; align-items: center; justify-content: center;
            gap: 18px; margin-top: 26px; flex-wrap: wrap; }
-.tolerance { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.tolerance input { width: 74px; margin: 0; }
 
 .status { min-height: 19px; margin: 11px 0 0; font-size: 12.8px; color: var(--ink-2); }
 .status.center { text-align: center; }

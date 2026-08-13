@@ -136,12 +136,12 @@ _TEMPLATE = """<!doctype html>
     <div class="card"><div class="n">{{ dvs.get('errors', 0) }}</div><div class="l">Errors</div></div>
   </div>
   <table>
-    <tr><th>Test ID</th><th>KPI</th><th>Dashboard</th><th>Generated SQL</th>
+    <tr><th>Test ID</th><th>KPI</th><th>Dashboard</th><th>{{ evidence_label }}</th>
         <th>Database</th><th>Difference</th><th>Time (ms)</th><th>Status</th></tr>
     {% for r in report.sql_validations %}
     <tr>
       <td>{{ r.test_id }}</td><td>{{ r.kpi_name }}</td><td>{{ r.dashboard_value }}</td>
-      <td class="pre">{{ r.generated_sql }}</td><td>{{ r.database_value }}</td>
+      <td class="pre">{{ r.source_evidence or r.generated_sql }}</td><td>{{ r.database_value }}</td>
       <td>{{ r.difference }}</td><td>{{ r.execution_time_ms }}</td>
       <td><span class="pill {{ dv_status_class(r) }}">{{ r.status }}</span></td>
     </tr>
@@ -220,6 +220,14 @@ def render_html(report: AnalysisReport) -> str:
         vs=report.validation_summary or {"total": 0, "passed": 0, "failed": 0, "critical": 0},
         dvs=report.data_validation_summary or {},
         tu=report.token_usage or {},
+        evidence_label=(
+            "Generated SQL"
+            if all(
+                (v.source_evidence or v.generated_sql or "").strip().upper().startswith("SELECT")
+                for v in report.sql_validations if (v.source_evidence or v.generated_sql)
+            )
+            else "How it was calculated"
+        ),
         findings=findings,
         sev_class=_sev_class,
         status_class=_status_class,

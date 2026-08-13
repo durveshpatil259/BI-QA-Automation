@@ -7,7 +7,7 @@ pipeline reasons about.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.core.constants import BIPlatform, DatasourceType, SqlAuthMode
 
@@ -94,6 +94,9 @@ class ValidationRow(BaseModel):
     scenario: str = ""
     dashboard_value: str = ""
     generated_sql: str = ""
+    #: How the source value was obtained, in the source's own terms. SQL Server
+    #: proves it with the query; a file proves it with sheet/operation/filters.
+    source_evidence: str = ""
     database_value: str = ""
     difference: str = ""
     match_type: str = ""
@@ -110,29 +113,54 @@ class ResultsResponse(BaseModel):
 
 # --- settings --------------------------------------------------------------
 class LLMSettingsRequest(BaseModel):
-    provider: str = "Grok"
-    #: Blank means "keep the stored key" — the UI never receives the secret.
-    api_key: str = ""
+    """Everything the browser is allowed to send.
+
+    Endpoint, credentials and token budget are resolved server-side from the
+    provider registry, so no secret can be typed into — or leaked through —
+    the frontend.
+    """
+
+    # "model_" is a protected Pydantic namespace; these are domain fields.
+    model_config = ConfigDict(protected_namespaces=())
+
+    provider: str = "Groq"
     model: str = ""
-    base_url: str = ""
-    temperature: float = Field(0.2, ge=0.0, le=1.0)
-    max_tokens: int = Field(2048, ge=256, le=32000)
 
 
 class LLMSettingsResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     provider: str
     model: str = ""
-    base_url: str = ""
-    temperature: float = 0.2
-    max_tokens: int = 2048
+    model_label: str = ""
     is_configured: bool = False
+    #: Whether the *backend* holds a usable key. Never the key itself.
     has_api_key: bool = False
-    providers: list[str] = []
-    presets: dict[str, dict] = {}
+
+
+class ProviderOption(BaseModel):
+    id: str
+    label: str
+    #: False when the backend has no credential for this provider.
+    configured: bool = True
+
+
+class ProviderListResponse(BaseModel):
+    providers: list[ProviderOption] = []
+    selected: str = ""
+
+
+class ModelOption(BaseModel):
+    id: str
+    label: str
 
 
 class ModelListResponse(BaseModel):
-    models: list[str] = []
+    models: list[ModelOption] = []
+    default: str = ""
+    #: Set when the live catalogue could not be read and the built-in list was
+    #: used instead — the UI shows it as a hint, not an error.
+    notice: str = ""
 
 
 class ErrorResponse(BaseModel):

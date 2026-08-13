@@ -95,36 +95,21 @@
       <span class="badge" id="llm-badge">Not configured</span>
     </summary>
     <p class="hint">
-      Required for SQL generation, test cases and AI reasoning. Without it the run
-      still produces metadata, DAX evaluation and a report — but no SQL validation.
-      Your key is stored locally and never sent to the browser again.
+      Select the LLM provider and model used for analysis. Credentials are held
+      on the server and never sent to the browser.
     </p>
     <div class="field-row">
-      <label>Provider <select id="llm-provider"></select></label>
-      <label>Preset
-        <select id="llm-preset"><option value="">— choose to autofill —</option></select>
-      </label>
-    </div>
-    <div class="field-row">
-      <label>API key <input id="llm-key" type="password" placeholder="leave blank to keep stored key"></label>
-      <label>Model <input id="llm-model" placeholder="e.g. llama-3.3-70b-versatile"></label>
-    </div>
-    <div class="field-row">
-      <label>Base URL <input id="llm-base" placeholder="provider default"></label>
-      <label>Max tokens <input id="llm-max" type="number" value="2048" min="256" max="32000" step="256"></label>
+      <label>LLM Provider <select id="llm-provider"></select></label>
+      <label>Model <select id="llm-model"></select></label>
     </div>
     <div class="llm-actions">
-      <button class="btn ghost sm" id="btn-llm-models">Fetch models</button>
-      <button class="btn ghost sm" id="btn-llm-test">Test</button>
+      <button class="btn ghost sm" id="btn-llm-test">Test connection</button>
       <button class="btn primary sm" id="btn-llm-save">Save</button>
     </div>
     <p class="status" id="llm-status"></p>
   </details>
 
   <div class="actions">
-    <label class="tolerance">Tolerance
-      <input id="tolerance" type="number" value="1" min="0" max="50" step="0.5"> %
-    </label>
     <button class="btn primary lg" id="btn-analyze" disabled>Analyze ▸</button>
   </div>
   <p class="status center" id="setup-status"></p>
@@ -174,7 +159,7 @@
       <table id="results">
         <thead><tr>
           <th>Test ID</th><th>KPI</th><th>Scenario</th><th>Dashboard reading</th>
-          <th>Query used to fetch</th><th>Database</th><th>Diff</th>
+          <th id="evidence-head">Query used to fetch</th><th>Database</th><th>Diff</th>
           <th>Match</th><th>ms</th><th>Status</th>
         </tr></thead>
         <tbody id="results-body"></tbody>

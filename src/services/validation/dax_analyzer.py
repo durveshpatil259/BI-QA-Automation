@@ -128,6 +128,32 @@ _COUNT_FUNCS = ("COUNTROWS", "DISTINCTCOUNT", "COUNT(")
 _COUNT_WORDS = ("count", "quantity", "orders", "customers", "resellers", "lines", "units")
 
 
+def _scales_to_percent(dax: str) -> bool:
+    """True when the measure itself already multiplies by 100.
+
+    ``DIVIDE(a, b, 0) * 100`` returns 35 for a 35% rate, so the value is
+    already in percentage points. Only a trailing top-level ``* 100`` counts —
+    a 100 buried inside an argument means something else entirely.
+    """
+    text = " ".join((dax or "").split())
+    if not text:
+        return False
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        ch = text[i]
+        if ch in ")]":
+            depth += 1
+        elif ch in "([":
+            depth -= 1
+        elif ch == "*" and depth == 0:
+            tail = text[i + 1:].strip()
+            try:
+                return float(tail) == 100.0
+            except ValueError:
+                return False
+    return False
+
+
 def infer_format_string(name: str, dax: str) -> str:
     """Guess a Power BI format string when the model does not supply one.
 
@@ -140,10 +166,13 @@ def infer_format_string(name: str, dax: str) -> str:
     d = (dax or "").upper()
 
     # A percentage is signalled by the name or by a ratio-shaped DAX.
-    if "%" in n or "percent" in n or "rate" in n:
-        return "0.0%"
-    if d.startswith("DIVIDE") and ("margin" in n or "ratio" in n or "share" in n):
-        return "0.0%"
+    if "%" in n or "percent" in n or "rate" in n or (
+        d.startswith("DIVIDE") and ("margin" in n or "ratio" in n or "share" in n)
+    ):
+        # A measure that already multiplies by 100 is expressed in percentage
+        # points, not as a ratio. Applying a "%" format would scale it again —
+        # a 35% rate rendered as 3500.0%.
+        return '0.0"%"' if _scales_to_percent(dax) else "0.0%"
 
     if any(f in d for f in _COUNT_FUNCS) or any(w in n for w in _COUNT_WORDS):
         return "#,0"
@@ -177,7 +206,12 @@ def apply_format(value: float, format_string: str) -> str:
     if not fs:
         return f"{number:,.2f}".rstrip("0").rstrip(".")
 
-    # Percentages: the stored value is a ratio, the display is x100.
+    # Percentages. A quoted "%" is a literal suffix: the measure already
+    # multiplies by 100, so scaling again turns a 35% rate into 3500%.
+    if '"%"' in fs:
+        plain = fs.replace('"%"', "")
+        decimals = len(plain.split(".")[-1]) if "." in plain else 0
+        return f"{number:.{decimals}f}%"
     if "%" in fs:
         decimals = len(fs.split(".")[-1].replace("%", "")) if "." in fs else 0
         return f"{number * 100:.{decimals}f}%"
@@ -201,7 +235,9 @@ def describe_format(format_string: str) -> str:
     parts: list[str] = []
     if "$" in clean:
         parts.append("currency prefix '$'")
-    if "%" in clean:
+    if '"%"' in clean:
+        parts.append("append '%' — the measure already multiplies by 100")
+    elif "%" in clean:
         parts.append("percentage: multiply by 100 and append '%'")
     if "," in clean:
         parts.append("thousands separator")

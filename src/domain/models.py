@@ -738,6 +738,10 @@ class SqlValidationResult(SerializableMixin):
     dashboard_value: str = ""
     dashboard_numeric: float | None = None
     generated_sql: str = ""
+    #: How this number was obtained, in the source's own terms — the SQL
+    #: for a database, or file/sheet/operation for a spreadsheet. Replaces
+    #: "Generated SQL" as evidence when the source has no SQL.
+    source_evidence: str = ""
     database_value: str = ""
     database_numeric: float | None = None
     difference: str = ""
