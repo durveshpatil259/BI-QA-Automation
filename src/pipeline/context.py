@@ -51,6 +51,13 @@ class PipelineContext:
     #: Tokens consumed by this run, broken down by stage.
     usage: UsageAccumulator = field(default_factory=UsageAccumulator, repr=False)
 
+    #: The key's daily budget as it stood when the run started.
+    budget_status: object | None = None
+    #: Set when the daily budget ran out mid-run. Later AI stages are skipped
+    #: rather than attempted: they would each fail identically, and on
+    #: providers that charge rejected calls, expensively.
+    budget_exhausted: bool = False
+
     # --- cooperative cancellation ----------------------------------------
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
 

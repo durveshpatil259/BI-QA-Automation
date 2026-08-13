@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import time
 
-from src.core import cancellation, usage
+from src.core import cancellation, token_budget, usage
 from src.core.exceptions import LLMConfigError, LLMProviderError, LLMResponseError
 from src.core.logger import get_logger
 from src.services.llm.base import LLMClient, LLMMessage, LLMResponse
@@ -139,6 +139,9 @@ class OpenAICompatibleClient(LLMClient):
                 raise LLMProviderError(f"Network error calling {endpoint}: {exc}") from exc
 
             if resp.status_code < 400:
+                # Kept for the daily ledger: some providers report remaining
+                # quota only in headers, which _parse_response never sees.
+                self._last_headers = dict(resp.headers)
                 try:
                     return resp.json()
                 except ValueError as exc:
@@ -334,16 +337,63 @@ class OpenAICompatibleClient(LLMClient):
         if not self.base_url:
             raise LLMConfigError(f"No base URL configured for {self.settings.provider}.")
         payload = self._build_payload(messages, max_tokens)
+        estimate = self._estimate_tokens(payload)
         _logger.info(
-            "Calling %s model=%s max_tokens=%s",
-            self.settings.provider, self.model, payload["max_tokens"],
+            "Calling %s model=%s max_tokens=%s (~%s tokens)",
+            self.settings.provider, self.model, payload["max_tokens"], f"{estimate:,}",
+        )
+        # Refuse before spending: a call sent past the daily cap is rejected
+        # *and* still counted by most providers, so trying costs tomorrow's
+        # allowance for nothing.
+        token_budget.check_affordable(
+            self.settings.provider, self.model, self.settings.api_key, estimate
         )
         # Providers bill prompt + max_tokens against the per-minute cap, and
         # charge rejected requests too — so wait for room rather than burst.
-        _pacer().acquire(self._estimate_tokens(payload))
-        response = self._parse_response(self._post(payload))
+        _pacer().acquire(estimate)
+        raw = self._post(payload)
+        response = self._parse_response(raw)
         usage.record(response.model or self.model, response.usage)
+        self._account(response, estimate)
         return response
+
+    def _account(self, response: LLMResponse, estimate: int) -> None:
+        """Charge the call to the daily ledger and report it on the console.
+
+        Billed against what the provider says it cost, falling back to the
+        estimate when a response carries no usage block — an uncounted call
+        would let the ledger drift below the real spend, which is the one
+        direction that matters.
+        """
+        spent = int((response.usage or {}).get("total_tokens") or 0)
+        prompt = int((response.usage or {}).get("prompt_tokens") or 0)
+        completion = int((response.usage or {}).get("completion_tokens") or 0)
+        if not spent:
+            spent = (prompt + completion) or estimate
+
+        token_budget.observe_provider_headers(
+            self.settings.provider, self.model, self.settings.api_key,
+            getattr(self, "_last_headers", None),
+        )
+        status = token_budget.record_usage(
+            self.settings.provider, self.model, self.settings.api_key, spent
+        )
+
+        collector = usage.current()
+        stage = collector.current_stage if collector else ""
+        run_total = f", run {collector.total_tokens:,}" if collector else ""
+        _logger.info(
+            "TOKENS | %s | call %s (prompt %s + completion %s)%s | %s",
+            stage or "llm", f"{spent:,}", f"{prompt:,}", f"{completion:,}",
+            run_total, status.describe(),
+        )
+        # One warning as the budget runs low, so a run that is about to stop
+        # says so while there is still time to act.
+        if status.enforced and 0 < status.remaining <= max(estimate, 2000):
+            _logger.warning(
+                "Daily token budget nearly exhausted for %s / %s: %s left.",
+                status.provider, status.model, f"{status.remaining:,}",
+            )
 
     @staticmethod
     def _estimate_tokens(payload: dict) -> int:
@@ -403,8 +453,15 @@ class OpenAICompatibleClient(LLMClient):
             "temperature": float(self.settings.temperature),
             "max_tokens": self.effective_max_tokens(max_tokens),
         }
+        estimate = self._estimate_tokens(payload)
         _logger.info(
             "Calling %s vision model=%s with %d image(s)",
             self.settings.provider, self.model, len(images),
         )
-        return self._parse_response(self._post(payload))
+        token_budget.check_affordable(
+            self.settings.provider, self.model, self.settings.api_key, estimate
+        )
+        response = self._parse_response(self._post(payload))
+        usage.record(response.model or self.model, response.usage)
+        self._account(response, estimate)
+        return response

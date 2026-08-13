@@ -82,6 +82,16 @@ class UsageAccumulator:
             )
 
     @property
+    def current_stage(self) -> str:
+        """The stage calls are being attributed to right now.
+
+        Read by the per-call console log so a line says *which* step spent the
+        tokens — "Generating SQL: 5,412" is actionable, a bare number is not.
+        """
+        with self._lock:
+            return self._label
+
+    @property
     def total_tokens(self) -> int:
         with self._lock:
             return sum(s.total_tokens for s in self._stages.values())

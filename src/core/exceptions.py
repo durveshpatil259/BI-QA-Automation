@@ -78,6 +78,19 @@ class LLMResponseError(LLMError):
     """Raised when an LLM returns an unusable/unparseable response."""
 
 
+class TokenBudgetExhausted(LLMError):
+    """Raised when the key's daily token budget cannot cover the next call.
+
+    Distinct from :class:`LLMProviderError` because the two need opposite
+    handling: a provider error is worth retrying, while an exhausted daily
+    budget will not clear until the reset, so every retry burns time and — on
+    providers that charge rejected requests — the next day's allowance too.
+
+    Callers treat it like a soft stop: finish with what has been produced, then
+    report where the run got to.
+    """
+
+
 class OperationCancelled(BITestPilotError):
     """Raised when the user cancels a run.
 

@@ -48,6 +48,12 @@ class ProviderConfig:
     known_models: tuple[tuple[str, str], ...] = ()
     #: Output-token budget. Per-call budgets clamp below this; it is only a cap.
     max_tokens: int = 3000
+    #: Free-tier tokens per day, counted by the local ledger. 0 disables
+    #: enforcement and leaves only tracking, which is the right default for a
+    #: paid account where the real limit is money rather than tokens.
+    tokens_per_day: int = 0
+    #: Per-model overrides for the above, as ``(model_id, tokens_per_day)``.
+    tokens_per_day_by_model: tuple[tuple[str, int], ...] = ()
 
     @property
     def label(self) -> str:
@@ -67,6 +73,17 @@ PROVIDERS: dict[LLMProvider, ProviderConfig] = {
             ("llama-3.1-8b-instant", "Llama 3.1 8B Instant"),
             ("openai/gpt-oss-120b", "GPT-OSS 120B"),
             ("openai/gpt-oss-20b", "GPT-OSS 20B"),
+        ),
+        # Groq's free tier is the one that actually runs out mid-run, so it is
+        # the only provider given defaults here. Check your own console — the
+        # allowance differs per model and Groq revises it; `llm_tokens_per_day`
+        # in app_config.json overrides everything below.
+        tokens_per_day=100_000,
+        tokens_per_day_by_model=(
+            ("llama-3.3-70b-versatile", 100_000),
+            ("llama-3.1-8b-instant", 500_000),
+            ("openai/gpt-oss-120b", 200_000),
+            ("openai/gpt-oss-20b", 200_000),
         ),
     ),
     LLMProvider.GEMINI: ProviderConfig(
@@ -168,6 +185,24 @@ def default_model_for(provider: LLMProvider) -> str:
 def max_tokens_for(provider: LLMProvider) -> int:
     config = PROVIDERS.get(provider)
     return config.max_tokens if config else 3000
+
+
+def tokens_per_day_for(provider: LLMProvider, model: str = "") -> int:
+    """Free-tier daily token cap, or 0 when there is no cap to enforce.
+
+    A per-model override wins: on Groq the same key gets a very different
+    daily allowance for a 70B model than for an 8B one, so a single
+    provider-wide number would either throttle the small model needlessly or
+    let the large one overrun.
+    """
+    config = PROVIDERS.get(provider)
+    if config is None:
+        return 0
+    wanted = (model or "").strip().casefold()
+    for model_id, limit in config.tokens_per_day_by_model:
+        if model_id.casefold() == wanted:
+            return limit
+    return config.tokens_per_day
 
 
 def friendly_name(provider: LLMProvider, model_id: str) -> str:

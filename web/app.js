@@ -121,7 +121,60 @@ function refreshLlmBadge() {
 }
 
 ["llm-provider", "llm-model"].forEach((id) =>
-  $(id).addEventListener("change", refreshLlmBadge));
+  $(id).addEventListener("change", () => { refreshLlmBadge(); refreshBudget(); }));
+
+/* Today's token spend for the *selected* provider and model.
+
+   Free to call — the server answers from its local ledger and never contacts
+   the provider — so it is refreshed on every change rather than cached. The
+   selection is passed explicitly because quota is granted per model: showing
+   the saved model's headroom while another is selected would report tokens
+   the next run will not have. */
+async function refreshBudget() {
+  const box = $("llm-budget");
+  const provider = $("llm-provider").value;
+  const model = $("llm-model").value;
+  if (!provider || !model) { box.hidden = true; return; }
+  try {
+    const res = await api("/api/settings/llm/budget?provider="
+      + encodeURIComponent(provider) + "&model=" + encodeURIComponent(model));
+    const b = await res.json();
+    if (!res.ok || !b.configured) { box.hidden = true; return; }
+    renderBudget(b);
+  } catch {
+    // A budget we cannot read must never block configuring the model.
+    box.hidden = true;
+  }
+}
+
+function renderBudget(b) {
+  const box = $("llm-budget");
+  const n = (v) => Number(v || 0).toLocaleString();
+  box.hidden = false;
+
+  if (!b.enforced) {
+    // No cap configured for this provider: report the spend, claim no limit.
+    box.className = "budget";
+    $("llm-budget-figure").textContent = `${n(b.used)} used today`;
+    $("llm-budget-fill").style.width = "0%";
+    $("llm-budget-note").textContent =
+      `${b.calls || 0} call(s) · no daily cap configured for this provider`;
+    return;
+  }
+
+  const pct = Math.min(100, Math.round((b.used / b.limit) * 100));
+  // Banded rather than a gradient: the only decision this drives is whether to
+  // start a run now or wait for the reset.
+  box.className = "budget" + (b.remaining <= 0 ? " spent"
+    : b.remaining < b.limit * 0.15 ? " low" : "");
+  $("llm-budget-figure").textContent =
+    `${n(b.remaining)} left of ${n(b.limit)}`;
+  $("llm-budget-fill").style.width = pct + "%";
+  const resets = (b.resets_at || "").slice(11, 16);
+  $("llm-budget-note").textContent = b.remaining <= 0
+    ? `Used up — analysis will not start until the budget resets at ${resets}.`
+    : `${n(b.used)} used across ${b.calls || 0} call(s) · resets ${resets}`;
+}
 
 /* Load the models for a provider and populate the dropdown. Called on load and
    whenever the provider changes — there is no Fetch button. */
@@ -178,6 +231,7 @@ async function loadLlm() {
   $("llm-provider").value = cfg.provider || provs.selected;
   await loadModels($("llm-provider").value, cfg.model);
   applyLlm(cfg);
+  refreshBudget();
 }
 
 // Changing the provider always reloads that provider's models.
@@ -217,6 +271,7 @@ $("btn-llm-save").addEventListener("click", async () => {
   const body = await postLlm("/api/settings/llm");
   if (!body) return;
   applyLlm(body);
+  refreshBudget();
   setStatus($("llm-status"), "AI model configuration saved successfully.", "ok");
 });
 
@@ -229,6 +284,7 @@ $("btn-llm-test").addEventListener("click", async () => {
   if (!body) return;
   // Testing does not persist anything — say so, or a successful test reads
   // as "configured" while runs still use the previously saved provider.
+  refreshBudget();          // the test itself costs a few tokens
   const suffix = body.ok && llmIsDirty() ? " Now click Save to use it." : "";
   setStatus($("llm-status"),
     (body.ok ? "✓ " : "✗ ") + body.message + suffix,
@@ -400,6 +456,9 @@ function stopRun(title, icon, cls, detail) {
 }
 
 async function finishRun(job) {
+  // A run is what actually moves the number, so refresh whatever the outcome:
+  // a failed or cancelled run has usually already spent part of the budget.
+  refreshBudget();
   if (job.state === "failed") {
     stopRun("Analysis failed", "✕", "failed", job.error);
     return;

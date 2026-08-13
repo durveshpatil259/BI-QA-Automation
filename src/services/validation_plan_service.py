@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from src.core.constants import DatasourceType
 from src.core import cancellation
-from src.core.exceptions import LLMResponseError, OperationCancelled, ValidationError
+from src.core.exceptions import (LLMResponseError, OperationCancelled,
+                                 TokenBudgetExhausted, ValidationError)
 from src.core.logger import get_logger
 from src.domain.models import (
     LLMSettings,
@@ -561,6 +562,7 @@ class ValidationPlanService:
         items: list[ValidationPlanItem] = []
         raw_parts: list[str] = []
         errors: list[str] = []
+        budget_exhausted = False
         model_name = client.model
 
         for index, batch in enumerate(batches, start=1):
@@ -581,6 +583,20 @@ class ValidationPlanService:
                 )
             except OperationCancelled:
                 raise  # a user decision, not a batch failure — stop immediately
+            except TokenBudgetExhausted as exc:
+                # The key is spent for today. Every remaining batch would fail
+                # the same way, so stop here and keep what was generated: a
+                # partial plan still validates the KPIs it covers, and
+                # coverage_note() tells the reader exactly what is missing.
+                errors.append(
+                    f"stopped after batch {index - 1} of {len(batches)}: {exc}"
+                )
+                _logger.warning(
+                    "Daily token budget reached at batch %d/%d — keeping %d "
+                    "query/queries generated so far.", index, len(batches), len(items),
+                )
+                budget_exhausted = True
+                break
             except Exception as exc:  # noqa: BLE001 - one batch must not kill all
                 errors.append(f"batch {index}: {exc}")
                 _logger.warning("Plan batch %d/%d failed: %s", index, len(batches), exc)
@@ -595,6 +611,12 @@ class ValidationPlanService:
                 _logger.warning("Plan batch %d/%d unparseable: %s", index, len(batches), exc)
 
         if not items:
+            if budget_exhausted:
+                # Nothing was generated *and* the key is spent: re-raise so the
+                # pipeline skips its remaining AI stages rather than treating
+                # this as an ordinary generation failure worth retrying.
+                raise TokenBudgetExhausted(errors[-1] if errors else
+                                           "Daily token budget exhausted.")
             raise LLMResponseError(
                 "Could not generate any SQL. " + (errors[0] if errors else "")
             )
@@ -617,6 +639,7 @@ class ValidationPlanService:
             batches_total=len(batches),
             batches_ok=len(raw_parts),
             errors=errors,
+            budget_exhausted=budget_exhausted,
         )
         if not plan.is_complete:
             _logger.warning("Validation plan INCOMPLETE: %s", plan.coverage_note())
@@ -630,7 +653,7 @@ class ValidationPlanService:
     # --- parsing ----------------------------------------------------------
     #: Requesting too many queries at once overflows the model's output budget
     #: and truncates the JSON. Batching keeps each response comfortably small.
-    MAX_ITEMS_PER_CALL = 10
+    MAX_ITEMS_PER_CALL = 15
 
     @staticmethod
     def _batch_scenarios(scenarios: list[dict], max_items: int) -> list[list[dict]]:

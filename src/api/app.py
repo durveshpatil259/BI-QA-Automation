@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.core.constants import APP_NAME, APP_TAGLINE
@@ -99,9 +99,20 @@ def create_app() -> FastAPI:
     if web_dir.is_dir():
         app.mount("/static", StaticFiles(directory=web_dir), name="static")
 
+        # The stylesheet and script are cached by the browser under a fixed
+        # URL, so an edit to either can keep showing the previous UI until a
+        # hard reload — a change looks like it did not happen. Stamping the
+        # link with the file's mtime gives each edit its own URL, so a normal
+        # reload picks it up. The asset itself stays cacheable.
         @app.get("/", include_in_schema=False)
         def index():
-            return FileResponse(web_dir / "index.html")
+            html = (web_dir / "index.html").read_text(encoding="utf-8")
+            for asset in ("styles.css", "app.js"):
+                path = web_dir / asset
+                if path.exists():
+                    html = html.replace(f"/static/{asset}",
+                                        f"/static/{asset}?v={int(path.stat().st_mtime)}")
+            return HTMLResponse(html)
 
     return app
 

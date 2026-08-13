@@ -80,6 +80,35 @@ def get_llm_settings(c: Container = Depends(container)):
     return _to_response(c.llm_service.load_global_settings())
 
 
+@router.get("/llm/budget")
+def llm_budget(provider: str = "", model: str = "",
+               c: Container = Depends(container)):
+    """Today's token spend for a key, and what is left.
+
+    Read-only and free — it consults the local ledger rather than the provider,
+    so it can be polled before a run without spending anything. Returns no
+    credential: the key is identified to the ledger only by a hash.
+
+    ``provider``/``model`` default to the saved configuration. The UI passes
+    whatever is selected in the dropdowns instead, because providers grant
+    quota per model: showing the saved model's budget while a different one is
+    selected would report headroom the next run will not have.
+    """
+    from src.core import token_budget
+
+    saved = c.llm_service.load_global_settings()
+    if provider.strip():
+        saved.provider = _provider_or_400(provider)
+        saved.model = model.strip()
+    settings = _resolved(saved)
+    if not settings.api_key.strip():
+        return {"configured": False, "message": "No API key configured on the server."}
+    status = token_budget.status_for(
+        settings.provider, settings.model, settings.api_key
+    )
+    return {"configured": True, "summary": status.describe(), **status.to_dict()}
+
+
 @router.get("/llm/providers", response_model=ProviderListResponse)
 def list_providers(c: Container = Depends(container)):
     """Providers with a working client, flagged by whether a key is configured."""

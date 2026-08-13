@@ -102,6 +102,14 @@
       <label>LLM Provider <select id="llm-provider"></select></label>
       <label>Model <select id="llm-model"></select></label>
     </div>
+    <div class="budget" id="llm-budget" hidden>
+      <div class="budget-head">
+        <span class="budget-label">Daily tokens</span>
+        <span class="budget-figure" id="llm-budget-figure"></span>
+      </div>
+      <div class="budget-bar"><span class="budget-fill" id="llm-budget-fill"></span></div>
+      <p class="budget-note" id="llm-budget-note"></p>
+    </div>
     <div class="llm-actions">
       <button class="btn ghost sm" id="btn-llm-test">Test connection</button>
       <button class="btn primary sm" id="btn-llm-save">Save</button>

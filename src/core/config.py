@@ -82,14 +82,32 @@ class AppConfig:
     # local LLM on CPU, where every generated token costs real seconds.
     #   max_scenarios      - filter combinations validated (1 = no slicer split)
     #   max_items_per_call - queries requested per LLM round-trip
+    #
+    # The schema, the rules and the table map are re-sent on every round-trip
+    # and dwarf the part that actually varies, so batch size is the main lever
+    # on what a run costs: at 10 items a run spent 84% of each prompt re-saying
+    # the same thing. Raise it further only while watching the batch-error
+    # count — too many items in one reply and the JSON truncates mid-object.
     max_scenarios: int = 10
-    max_items_per_call: int = 10
+    max_items_per_call: int = 15
 
     # Client-side pacing against the provider's tokens-per-minute cap. A batch
     # costs ~5,400 tokens, so only two fit Groq's free-tier 12,000 TPM window;
     # sending nine at once got most of them rejected *and* still charged them
     # against the daily quota. 0 disables pacing (paid tiers, local models).
     llm_tokens_per_minute: int = 12000
+
+    # The daily cap, which pacing cannot solve — waiting does not refill it.
+    # Tracked per key in config/token_usage.json and checked before each call,
+    # so a spent key stops the run cleanly instead of failing every remaining
+    # batch with a 429. 0 = use the provider's known free-tier figure; set a
+    # number here to override it for every provider.
+    llm_tokens_per_day: int = 0
+    # Refuse to start a run with less than this left, rather than burning the
+    # remainder on a report that would be too incomplete to act on. 0 = start
+    # whenever any budget at all remains.
+    llm_min_tokens_to_start: int = 6000
+
     # Optional machine-level default API keys per provider. Per-project
     # settings always take precedence over these.
     default_api_keys: dict[str, str] = field(default_factory=dict)

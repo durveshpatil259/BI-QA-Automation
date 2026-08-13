@@ -1,0 +1,25 @@
+{
+  "entries": {
+    "Groq|llama-3.3-70b-versatile|ff31629ccdbff9ef": {
+      "date": "2026-08-13",
+      "tokens": 98550,
+      "calls": 17,
+      "provider_remaining": null,
+      "updated_at": "2026-08-13T17:30:44"
+    },
+    "Groq|llama-3.1-8b-instant|ff31629ccdbff9ef": {
+      "date": "2026-08-13",
+      "tokens": 9314,
+      "calls": 2,
+      "provider_remaining": null,
+      "updated_at": "2026-08-13T17:33:10"
+    },
+    "Groq|llama-3.3-70b-versatile|458d24069d5a36f8": {
+      "date": "2026-08-13",
+      "tokens": 74099,
+      "calls": 14,
+      "provider_remaining": null,
+      "updated_at": "2026-08-13T17:54:13"
+    }
+  }
+}

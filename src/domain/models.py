@@ -495,6 +495,7 @@ class DbSchema(SerializableMixin):
         max_samples: int = 4,
         include_samples: bool = False,
         include_row_counts: bool = False,
+        verbose: bool = False,
     ) -> str:
         """Render the schema for an AI prompt — **identifiers only by default**.
 
@@ -507,6 +508,10 @@ class DbSchema(SerializableMixin):
 
         Pass *wanted* (the dashboard's table names) to send only the tables the
         report actually uses — least privilege, and less noise for the model.
+
+        The default form is one line per table; *verbose* restores the older
+        column-per-line listing with full data types, which is easier to read
+        when a human is inspecting a prompt but roughly five times the size.
         """
         tables = self.relevant_tables(wanted or set())
         lines: list[str] = ["TABLES:"]
@@ -515,13 +520,51 @@ class DbSchema(SerializableMixin):
                 f" ~{t.row_count} rows"
                 if include_row_counts and t.row_count is not None else ""
             )
+            shown = t.columns[:max_columns]
+
+            # One line per table rather than one per column. The schema is
+            # re-sent on *every* generation batch, so its size is multiplied by
+            # the batch count: on a 49-table warehouse the column-per-line form
+            # cost 2,688 tokens a call — 35,000 over a run — for information a
+            # single line carries just as well.
+            if not verbose:
+                names = ", ".join(
+                    c.name + ("*" if c.is_primary_key else "") for c in shown
+                )
+                if len(t.columns) > max_columns:
+                    names += f", …+{len(t.columns) - max_columns}"
+                lines.append(f"  {t.full_name}({names}){counts}")
+                # Types are kept only where the SQL actually turns on them: a
+                # date column decides whether a filter needs a cast, and no
+                # name reliably says "this is a date".
+                dated = [c.name for c in shown
+                         if "date" in (c.data_type or "").lower()
+                         or "time" in (c.data_type or "").lower()]
+                if dated:
+                    lines.append(f"      date/time: {', '.join(dated)}")
+                # Samples stay opt-in and stay per column, because their whole
+                # purpose is to show the *literal form* of a value a WHERE
+                # clause must match ('FY2018' vs '2018'). Compacting them into
+                # one undifferentiated list would lose which column is which.
+                if include_samples:
+                    for c in shown:
+                        if c.sample_values:
+                            values = ", ".join(
+                                repr(v) for v in c.sample_values[:max_samples])
+                            lines.append(f"      {c.name} e.g. {values}")
+                for fk in t.foreign_keys:
+                    lines.append(
+                        f"      FK {fk.column} -> {fk.ref_table}.{fk.ref_column}"
+                    )
+                continue
+
             lines.append(f"  {t.full_name} [{t.kind}]{counts}")
-            for c in t.columns[:max_columns]:
+            for c in shown:
                 marks = " (PK)" if c.is_primary_key else ""
                 samples = ""
                 if include_samples and c.sample_values:
-                    shown = ", ".join(repr(v) for v in c.sample_values[:max_samples])
-                    samples = f"  e.g. {shown}"
+                    values = ", ".join(repr(v) for v in c.sample_values[:max_samples])
+                    samples = f"  e.g. {values}"
                 lines.append(f"      {c.name}: {c.data_type}{marks}{samples}")
             if len(t.columns) > max_columns:
                 lines.append(f"      … and {len(t.columns) - max_columns} more columns")
@@ -537,10 +580,18 @@ class DbSchema(SerializableMixin):
                 "those referenced by the dashboard and their join partners)"
             )
 
-        if self.join_hints:
+        # Join paths are only useful between tables the model can actually see.
+        # A shared warehouse holds unrelated schemas, and their hints outnumbered
+        # the real ones 40 to 20 here — two thirds of this section described
+        # joins between tables that were never sent. Worse than the token cost:
+        # it invites a join to a table the model has no columns for.
+        sent = {t.full_name for t in tables[:max_tables]}
+        hints = [j for j in self.join_hints
+                 if j.from_table in sent and j.to_table in sent]
+        if hints:
             lines.append("")
             lines.append("JOIN PATHS (use these to join fact and dimension tables):")
-            for j in self.join_hints:
+            for j in hints:
                 tag = " [inferred from naming]" if j.inferred else " [declared FK]"
                 lines.append(
                     f"  {j.from_table}.{j.from_column} = {j.to_table}.{j.to_column}{tag}"
@@ -708,6 +759,11 @@ class ValidationPlan(SerializableMixin):
     batches_total: int = 0
     batches_ok: int = 0
     errors: list[str] = field(default_factory=list)
+    #: True when generation stopped because the key's daily token budget ran
+    #: out. A distinct flag rather than a parsed error string: the pipeline
+    #: skips its remaining AI stages on this, and the reason changes what the
+    #: user should do — wait for the reset, not investigate a failure.
+    budget_exhausted: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -717,7 +773,16 @@ class ValidationPlan(SerializableMixin):
         """Human-readable warning when the plan is partial. Empty if complete."""
         if self.is_complete:
             return ""
-        failed = self.batches_total - self.batches_ok
+        done = self.batches_ok
+        if self.budget_exhausted:
+            return (
+                f"The daily token budget ran out after {done} of "
+                f"{self.batches_total} SQL-generation batches, so this plan "
+                f"covers only {len(self.items)} validation(s). Everything "
+                f"generated before that point was executed and is reported "
+                f"below. {self.errors[-1] if self.errors else ''}"
+            )
+        failed = self.batches_total - done
         return (
             f"{failed} of {self.batches_total} SQL-generation batches failed, so "
             f"this plan is incomplete — only {len(self.items)} validation(s) were "

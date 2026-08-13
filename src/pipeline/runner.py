@@ -13,12 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.core import cancellation, usage
-from src.core.exceptions import BITestPilotError, OperationCancelled
+from src.core.exceptions import (BITestPilotError, OperationCancelled,
+                                 TokenBudgetExhausted)
 from src.core.logger import get_logger
 from src.domain.models import LLMSettings
 from src.pipeline.context import PipelineContext
 from src.pipeline.progress import ProgressReporter
-from src.pipeline.stages import STAGE_ORDER, STAGE_POLICY, FailurePolicy, Stage
+from src.pipeline.stages import (AI_STAGES, STAGE_ORDER, STAGE_POLICY,
+                                 FailurePolicy, Stage)
 
 _logger = get_logger()
 
@@ -75,14 +77,64 @@ class PipelineRunner:
         # services can abort mid-stage, not just at these stage boundaries.
         with cancellation.use_token(cancellation.CancelToken(ctx.cancel_event)), \
                 usage.use_collector(ctx.usage):
+            self._check_budget(ctx)
             self._run_stages(ctx, reporter, handlers)
         return ctx
+
+    def _check_budget(self, ctx: PipelineContext) -> None:
+        """Refuse to start on a key that cannot pay for the run.
+
+        Better to say so up front than to extract metadata, read the schema and
+        evaluate DAX — minutes of work — only to produce a report with no
+        validations in it because the first LLM call was rejected.
+        """
+        from src.core import token_budget
+        from src.core.config import load_config
+        from src.core.exceptions import TokenBudgetExhausted
+
+        try:
+            settings = self._settings(ctx)
+        except Exception:  # noqa: BLE001 - a missing key is reported by its stage
+            return
+        if not settings or not settings.is_configured:
+            return
+
+        status = token_budget.status_for(
+            settings.provider, settings.model, settings.api_key
+        )
+        ctx.budget_status = status
+        _logger.info("Token budget before run | %s", status.describe())
+        if not status.enforced:
+            return
+
+        floor = int(getattr(load_config(), "llm_min_tokens_to_start", 0) or 0)
+        if status.remaining <= 0:
+            raise TokenBudgetExhausted(
+                f"Daily token budget already used up for {status.provider} / "
+                f"{status.model}: {status.used:,} of {status.limit:,}. It resets "
+                f"at {status.resets_at[:16].replace('T', ' ')}. Nothing was run."
+            )
+        if floor and status.remaining < floor:
+            # Enough for a call or two, not enough for a report worth reading.
+            raise TokenBudgetExhausted(
+                f"Only {status.remaining:,} tokens left today for {status.provider} / "
+                f"{status.model}, and a run needs about {floor:,} to produce a "
+                f"usable report. It resets at "
+                f"{status.resets_at[:16].replace('T', ' ')}. Nothing was run."
+            )
 
     def _run_stages(self, ctx, reporter, handlers) -> None:
         for index, stage in enumerate(STAGE_ORDER, start=1):
             if ctx.cancelled:
                 reporter.emit(stage, index, "skipped", "Cancelled by user.")
                 raise PipelineCancelled("Run cancelled.")
+
+            if ctx.budget_exhausted and stage in AI_STAGES:
+                detail = "Skipped — the daily token budget was used up earlier in this run."
+                ctx.warn(f"{stage.value}: {detail}")
+                reporter.emit(stage, index, "skipped", detail)
+                _logger.info("stage=%s status=skipped-no-budget", stage.name)
+                continue
 
             reporter.emit(stage, index, "running")
             try:
@@ -96,6 +148,16 @@ class PipelineRunner:
                 reporter.emit(stage, index, "skipped", "Cancelled by user.")
                 _logger.info("stage=%s status=cancelled", stage.name)
                 raise
+            except TokenBudgetExhausted as exc:
+                # Not a failure of this stage and not worth retrying: the key
+                # is spent until the reset. Every later AI stage is skipped,
+                # but the deterministic ones still run so the user gets a
+                # report covering everything that did complete.
+                ctx.budget_exhausted = True
+                ctx.warn(f"{stage.value} stopped: {exc}")
+                reporter.emit(stage, index, "skipped", str(exc))
+                _logger.warning("stage=%s status=budget-exhausted | %s",
+                                stage.name, exc)
             except Exception as exc:  # noqa: BLE001 - policy decides what happens
                 policy = STAGE_POLICY[stage]
                 detail = f"{stage.value} failed: {exc}"
@@ -157,6 +219,11 @@ class PipelineRunner:
         ctx.validation_plan = self._s.validation_plan_service.generate(
             ctx.project, settings
         )
+        # Generation may have stopped mid-way on a spent key. The plan it did
+        # produce is still worth executing, so this is a flag rather than a
+        # raise — but the later AI stages must not try again.
+        if getattr(ctx.validation_plan, "budget_exhausted", False):
+            ctx.budget_exhausted = True
         # A partial plan silently shrinks the whole report, so it must reach the
         # user as a warning rather than just a smaller number of validations.
         note = getattr(ctx.validation_plan, "coverage_note", lambda: "")()
@@ -181,11 +248,25 @@ class PipelineRunner:
         return f"{len(ctx.test_cases)} test case(s)"
 
     def _build_report(self, ctx: PipelineContext) -> str:
+        token_usage = ctx.usage.to_dict()
+        # The reader needs to know a short report was short *because the key
+        # ran out*, not because the dashboard had little to check.
+        token_usage["budget_exhausted"] = ctx.budget_exhausted
+        if ctx.budget_status is not None:
+            token_usage["daily_budget"] = ctx.budget_status.to_dict()
         ctx.report = self._s.report_service.build_report(
-            ctx.project, token_usage=ctx.usage.to_dict()
+            ctx.project, token_usage=token_usage
         )
         total = ctx.usage.total_tokens
         suffix = f" · {total:,} tokens across {ctx.usage.total_calls} call(s)" if total else ""
+        if ctx.budget_exhausted:
+            suffix += " · STOPPED EARLY: daily token budget exhausted"
+        _logger.info("Run token cost | %s tokens over %s call(s)%s",
+                     f"{total:,}", ctx.usage.total_calls,
+                     " | budget exhausted" if ctx.budget_exhausted else "")
+        for entry in ctx.usage.stages:
+            _logger.info("  %-28s %6s tokens over %d call(s)",
+                         entry.stage, f"{entry.total_tokens:,}", entry.calls)
         return f"Report {ctx.report.id}{suffix}"
 
     # --- helpers ----------------------------------------------------------

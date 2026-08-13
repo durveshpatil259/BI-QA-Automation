@@ -49,6 +49,16 @@ STAGE_ORDER: list[Stage] = [
 ]
 
 
+#: Stages that spend LLM tokens. Declared here with the rest of the pipeline
+#: definition so the runner can skip them all once the daily budget is gone,
+#: instead of letting each one discover the same exhausted key.
+AI_STAGES: frozenset[Stage] = frozenset({
+    Stage.LLM_ANALYSIS,
+    Stage.GENERATE_SQL,
+    Stage.GENERATE_TESTS,
+})
+
+
 #: Failure policy per stage — see docs/ARCHITECTURE_V2.md §3.
 STAGE_POLICY: dict[Stage, FailurePolicy] = {
     # Without a model there is nothing to validate at all.

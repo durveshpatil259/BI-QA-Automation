@@ -170,6 +170,28 @@ input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--brand) 4
 }
 .badge.ok { background: var(--pass-bg); color: var(--pass); }
 .badge.dirty { background: var(--warn-bg); color: var(--warn); }
+/* Daily token budget. Sits between the model choice and the buttons because
+   that is the order the decision is made in: pick a model, see what it has
+   left today, then act. Quiet by default — it only earns attention as the
+   budget runs down, which is what the colour change is for. */
+.budget { margin-top: 16px; }
+.budget-head { display: flex; align-items: baseline;
+               justify-content: space-between; gap: 12px; }
+.budget-label { font-size: 12.5px; color: var(--ink-2); }
+.budget-figure { font-size: 12.5px; font-weight: 620; color: var(--ink);
+                 font-variant-numeric: tabular-nums; }
+.budget-bar { height: 5px; margin-top: 7px; overflow: hidden;
+              background: var(--surface-2); border-radius: 99px; }
+/* Width is set inline from the live figure; only the colour is themed here. */
+.budget-fill { display: block; width: 0; height: 100%; border-radius: 99px;
+               background: var(--brand); transition: width .3s ease; }
+.budget.low .budget-fill { background: var(--warn); }
+.budget.low .budget-figure { color: var(--warn); }
+.budget.spent .budget-fill { background: var(--fail); }
+.budget.spent .budget-figure { color: var(--fail); }
+.budget-note { margin: 6px 0 0; font-size: 11.5px; color: var(--ink-2); }
+.budget-note:empty { display: none; }
+
 /* Actions sit together at the trailing edge, secondary then primary — the same
    shape as .downloads on the results screen. Grouping them reads as one
    decision point, and the left-to-right order matches the workflow: test it,

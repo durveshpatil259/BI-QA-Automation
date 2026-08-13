@@ -344,7 +344,16 @@ def build_plan_user_prompt(
                     lines.append(f"      categories shown: {', '.join(cats[:20])}")
         lines.append("")
 
-    lines += ["DATABASE SCHEMA:", schema_text or "(no schema provided)", ""]
+    # The notation has to be stated or it is guessable-but-ambiguous: a bare
+    # asterisk reads as a wildcard, and "FK a -> b.c" could be either direction.
+    lines += [
+        "DATABASE SCHEMA — written as schema.table(column, column, …). "
+        "A trailing * marks a primary key. 'date/time:' lists the columns with "
+        "a date or timestamp type; every other column is non-temporal. "
+        "'FK col -> table.col' is a foreign key on the table it appears under.",
+        schema_text or "(no schema provided)",
+        "",
+    ]
     # Placed after the schema so it is the last thing read before the task:
     # which physical table backs each model table is settled by Python, not
     # inferred from name similarity.
