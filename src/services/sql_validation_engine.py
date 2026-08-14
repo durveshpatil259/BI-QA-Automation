@@ -58,7 +58,11 @@ class SqlValidationEngine:
             # quietly dropped.
             metadata = self._repo.load_metadata(project) if project else None
             return build_file_adapter(config, metadata)
-        return SqlServerAdapter(create_connector(config), db_schema)
+        # The database path now gets the model too, so a measure whose DAX the
+        # compiler understands is computed from that rather than from generated
+        # SQL — same reasoning, and the same compiler, as the file path.
+        metadata = self._repo.load_metadata(project) if project else None
+        return SqlServerAdapter(create_connector(config), db_schema, metadata)
 
     def run(
         self,

@@ -31,7 +31,7 @@ _logger = get_logger()
 class _Unsupported(Exception):
     """Raised inside a regex callback when a construct cannot be compiled."""
 
-__all__ = ["CompiledMeasure", "compile_measure"]
+__all__ = ["CompiledMeasure", "Dialect", "DUCKDB", "TSQL", "compile_measure"]
 
 #: ``SUM(Table[Column])`` and friends.
 _AGGREGATE = re.compile(
@@ -73,6 +73,65 @@ class CompiledMeasure:
 
 def _quote(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
+
+
+class Dialect:
+    """The handful of places SQL engines actually disagree.
+
+    Everything else the compiler emits — CASE, NULLIF, COALESCE, COUNT(DISTINCT),
+    scalar subqueries — is identical across DuckDB and T-SQL, so only date
+    handling and identifier quoting need a per-engine form.
+    """
+
+    name = "duckdb"
+    timestamp_type = "TIMESTAMP"
+
+    def quote(self, name: str) -> str:
+        return '"' + str(name).replace('"', '""') + '"'
+
+    def cast_ts(self, expr: str) -> str:
+        return f"TRY_CAST({expr} AS {self.timestamp_type})"
+
+    def date_diff(self, unit: str, start: str, end: str) -> str:
+        return f"date_diff('{unit}', {self.cast_ts(start)}, {self.cast_ts(end)})"
+
+    def date_part(self, part: str, expr: str) -> str:
+        return f"{part}({self.cast_ts(expr)})"
+
+    def date_trunc(self, unit: str, expr: str) -> str:
+        return f"date_trunc('{unit}', {expr})"
+
+    def date_shift(self, expr: str, amount: str, unit: str) -> str:
+        return f"({expr} + INTERVAL '{amount} {unit}')"
+
+
+class TSqlDialect(Dialect):
+    """SQL Server. Brackets, DATETIME, and date functions that take no quotes."""
+
+    name = "tsql"
+    timestamp_type = "DATETIME"
+
+    def quote(self, name: str) -> str:
+        text = str(name)
+        # A schema-qualified name arrives as dbo.Table and must stay two parts.
+        if "." in text and "[" not in text:
+            return ".".join(f"[{p.replace(']', ']]')}]" for p in text.split("."))
+        return f"[{text.replace(']', ']]')}]"
+
+    def date_diff(self, unit: str, start: str, end: str) -> str:
+        return f"DATEDIFF({unit}, {self.cast_ts(start)}, {self.cast_ts(end)})"
+
+    def date_trunc(self, unit: str, expr: str) -> str:
+        # No DATE_TRUNC before SQL Server 2022. Counting whole periods from the
+        # zero date and adding them back is the portable idiom.
+        return f"DATEADD({unit}, DATEDIFF({unit}, 0, {expr}), 0)"
+
+    def date_shift(self, expr: str, amount: str, unit: str) -> str:
+        return f"DATEADD({unit}, {amount}, {expr})"
+
+
+DUCKDB = Dialect()
+TSQL = TSqlDialect()
 
 
 def _strip_parens(text: str) -> str:
@@ -124,8 +183,10 @@ class _Compiler:
     """Walks one measure's DAX, resolving references against the model."""
 
     def __init__(self, metadata, resolve_column, filter_for=None,
-                 related_for=None, column_filter=None, max_depth: int = 8):
+                 related_for=None, column_filter=None, max_depth: int = 8,
+                 dialect: Dialect | None = None):
         self._metadata = metadata
+        self._d = dialect or DUCKDB
         self._resolve = resolve_column     # (table, column) -> ResolvedField|None
         # (dataset) -> (joins, clauses) applying the scenario's filter to it.
         # A DAX filter context narrows *every* aggregate in the measure, so it
@@ -146,6 +207,9 @@ class _Compiler:
         self._aliases = 0
         self.datasets: set[str] = set()
         self.notes: list[str] = []
+
+    def _q(self, name: str) -> str:
+        return self._d.quote(name)
 
     def _next_alias(self) -> int:
         self._aliases += 1
@@ -174,7 +238,7 @@ class _Compiler:
                 all_joins.extend(more_joins)
                 all_clauses.extend(more_clauses)
 
-        sql = f'FROM {_quote(dataset)} AS base'
+        sql = f'FROM {self._q(dataset)} AS base'
         if all_joins:
             sql += " " + " ".join(dict.fromkeys(all_joins))
         if all_clauses:
@@ -415,8 +479,8 @@ class _Compiler:
         latter.
         """
         joins, clauses = self._filter_for(dataset) if self._filter_for else ([], [])
-        sql = (f'SELECT {function}(TRY_CAST(base.{_quote(column)} AS TIMESTAMP)) '
-               f'FROM {_quote(dataset)} AS base')
+        sql = (f'SELECT {function}({self._d.cast_ts("base." + self._q(column))}) '
+               f'FROM {self._q(dataset)} AS base')
         if joins:
             sql += " " + " ".join(dict.fromkeys(joins))
         if clauses:
@@ -439,12 +503,12 @@ class _Compiler:
             joins, ref, date_dataset, date_column = located
             if not ref:
                 return [], []
-            shift = f"INTERVAL '{amount} {unit}'"
-            cast = f"TRY_CAST({ref} AS TIMESTAMP)"
-            return joins, [
-                f"{cast} >= {self._date_bound('MIN', date_dataset, date_column)} + {shift}",
-                f"{cast} <= {self._date_bound('MAX', date_dataset, date_column)} + {shift}",
-            ]
+            cast = self._d.cast_ts(ref)
+            lo = self._d.date_shift(
+                self._date_bound("MIN", date_dataset, date_column), amount, unit)
+            hi = self._d.date_shift(
+                self._date_bound("MAX", date_dataset, date_column), amount, unit)
+            return joins, [f"{cast} >= {lo}", f"{cast} <= {hi}"]
         return build
 
     def _period_to_date(self, table: str, column: str, unit: str):
@@ -464,8 +528,8 @@ class _Compiler:
             if not ref:
                 return [], []
             anchor = self._date_bound("MAX", date_dataset, date_column)
-            cast = f"TRY_CAST({ref} AS TIMESTAMP)"
-            return joins, [f"{cast} >= date_trunc('{unit}', {anchor})",
+            cast = self._d.cast_ts(ref)
+            return joins, [f"{cast} >= {self._d.date_trunc(unit, anchor)}",
                            f"{cast} <= {anchor}"]
         return build
 
@@ -503,8 +567,8 @@ class _Compiler:
         if field is None:
             return None
         self.datasets.add(field.dataset)
-        target = f"DISTINCT {_quote(field.column)}" if function == "DISTINCTCOUNT" \
-            else _quote(field.column)
+        target = f"DISTINCT {self._q(field.column)}" if function == "DISTINCTCOUNT" \
+            else self._q(field.column)
         return (f'(SELECT {sql_function}({target}) '
                 f'{self._from_clause(field.dataset)})')
 
@@ -594,7 +658,7 @@ class _Compiler:
                 alias = f"r{self._next_alias()}"
                 aliases[dataset] = alias
                 joins.append(join_sql.format(alias=alias))
-            return f"{alias}.{_quote(column)}"
+            return f"{alias}.{self._q(column)}"
 
         try:
             text = re.sub(
@@ -630,7 +694,7 @@ class _Compiler:
                 last = match.end()
                 continue
             out.append(text[last:match.start()])
-            out.append(f"base.{_quote(field.column)}")
+            out.append(f"base.{self._q(field.column)}")
             last = match.end()
         out.append(text[last:])
         rewritten = "".join(out)
@@ -639,9 +703,8 @@ class _Compiler:
         # are cast for the same reason as the date parts below.
         rewritten = re.sub(
             r"\bDATEDIFF\s*\(\s*([^(),]+?)\s*,\s*([^(),]+?)\s*,\s*(\w+)\s*\)",
-            lambda m: (f"date_diff('{m.group(3).lower()}', "
-                       f"TRY_CAST({m.group(1)} AS TIMESTAMP), "
-                       f"TRY_CAST({m.group(2)} AS TIMESTAMP))"),
+            lambda m: self._d.date_diff(m.group(3).lower(),
+                                        m.group(1), m.group(2)),
             rewritten, flags=re.IGNORECASE)
 
         # ISBLANK(x) -> x IS NULL. A still-open record has no discharge date,
@@ -658,7 +721,7 @@ class _Compiler:
         for pattern, sql in ((r"<>\s*BLANK\s*\(\s*\)", "IS NOT NULL"),
                              (r"=\s*BLANK\s*\(\s*\)", "IS NULL")):
             rewritten = re.sub(
-                r'((?:base|[rkf]\d+)\."[^"]*")\s*' + pattern,
+                r'((?:base|[rkf]\d+)\.(?:"[^"]*"|\[[^\]]*\]))\s*' + pattern,
                 lambda m, s=sql: f"({m.group(1)} {s})",
                 rewritten, flags=re.IGNORECASE)
 
@@ -668,18 +731,20 @@ class _Compiler:
         for dax_name, sql_name in self._SCALAR_FUNCS.items():
             rewritten = re.sub(
                 rf"\b{dax_name}\s*\(\s*([^()]+?)\s*\)",
-                lambda m, fn=sql_name: f"{fn}(TRY_CAST({m.group(1)} AS TIMESTAMP))",
+                lambda m, fn=sql_name: self._d.date_part(fn, m.group(1)),
                 rewritten, flags=re.IGNORECASE)
 
         # Whatever is left must be operators, numbers, our own references and
         # the functions above — anything else is DAX we do not understand.
-        residue = re.sub(r'(?:base|[rkf]\d+)\."[^"]*"', "", rewritten)
+        residue = re.sub(r'(?:base|[rkf]\d+)\.(?:"[^"]*"|\[[^\]]*\])', "", rewritten)
         residue = re.sub(r"'[^']*'", "", residue)          # string literals
-        residue = residue.replace("TRY_CAST(", "(").replace(" AS TIMESTAMP", "")
+        residue = residue.replace("TRY_CAST(", "(").replace(
+            f" AS {self._d.timestamp_type}", "")
         for sql_name in self._SCALAR_FUNCS.values():
             residue = residue.replace(f"{sql_name}(", "(")
         for keyword in ("CASE", "WHEN", "THEN", "ELSE", "END", "IS NOT NULL",
-                        "IS NULL", "date_diff(", " AND ", " OR "):
+                        "IS NULL", "date_diff(", "DATEDIFF(", "DATEADD(",
+                        " AND ", " OR "):
             residue = residue.replace(keyword, "")
         if re.search(r"[A-Za-z_]", residue):
             return None, None
@@ -687,12 +752,13 @@ class _Compiler:
 
 
 def compile_measure(name: str, metadata, resolve_column, filter_for=None,
-                    related_for=None, column_filter=None) -> CompiledMeasure | None:
+                    related_for=None, column_filter=None,
+                    dialect: Dialect | None = None) -> CompiledMeasure | None:
     """Compile a named measure to SQL, or None when it is out of scope."""
     if not metadata:
         return None
     compiler = _Compiler(metadata, resolve_column, filter_for, related_for,
-                         column_filter)
+                         column_filter, dialect=dialect)
     dax = compiler._measure_dax(name)
     if not dax:
         return None

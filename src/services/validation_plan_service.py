@@ -28,6 +28,7 @@ from src.services.llm.json_utils import extract_json
 from src.services.llm.prompt_builder import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
 from src.services.validation.filter_reach import filter_applies
 from src.services.validation.sql_guard import is_read_only
+from src.services.validation.sql_repair import repair_sql
 from src.storage.project_repository import ProjectRepository
 
 _logger = get_logger()
@@ -761,6 +762,11 @@ class ValidationPlanService:
                 continue
             name = str(raw.get("kpi_name", raw.get("kpi", ""))).strip()
             sql = str(raw.get("generated_sql", raw.get("sql", ""))).strip()
+            # Supply a FROM clause the model left out. It knows which table the
+            # KPI belongs to — it is right there in the same object — so this
+            # costs nothing and turns an unbound-identifier error into a real
+            # comparison. Structural only: never touches the arithmetic.
+            sql, repair_note = repair_sql(sql, str(raw.get("table", "")).strip())
             sid = str(raw.get("scenario", "")).strip() or default_sid
             sc = by_scenario.get(sid, {})
             filters = raw.get("filters", []) or []
@@ -791,6 +797,20 @@ class ValidationPlanService:
             if item_type in ("grouped", "structural"):
                 item.visual_title = name
                 item.expected_points = visual_points.get((sid, name.casefold()), [])
+            # A repaired query must say so, or the report shows SQL that the
+            # model never wrote and a reader cannot reconcile it with the run.
+            if repair_note:
+                item.business_meaning = (
+                    (item.business_meaning + " ").strip()
+                    + f"[Python repair: {repair_note}. Treat the result with "
+                    "caution — a missing FROM usually means the model was "
+                    "compressing, and the rest of the query may be wrong too.]"
+                )
+                # A repaired query must not read as a clean result. One real
+                # example computed (total - total) / total, which is always
+                # zero; the dashboard also showed 0.0%, so executing it would
+                # have scored a pass for entirely the wrong reason.
+                item.confidence = min(item.confidence, 0.3)
             # Flag non-read-only SQL so execution (V5) can skip it safely.
             if sql and not is_read_only(sql):
                 item.business_meaning = (
