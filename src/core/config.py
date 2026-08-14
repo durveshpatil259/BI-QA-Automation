@@ -91,6 +91,21 @@ class AppConfig:
     max_scenarios: int = 10
     max_items_per_call: int = 15
 
+    # Slicer values validated per slicer. Every value of every slicer re-proves
+    # the same filter path: if a measure recalculates for FY2018 it does so for
+    # FY2019 too. One representative value per slicer keeps the evidence that
+    # each slicer *works* without paying for the repetition. Raise it when a
+    # specific slicer value is known to behave differently.
+    values_per_slicer: int = 1
+
+    # Per-subject caps on generated (unexecuted) template tests. Executed
+    # validations are never capped — each is a measured result. These trim the
+    # restatements around them: a KPI does not need nine phrasings of the same
+    # check to be well covered.
+    max_high_tests_per_subject: int = 3
+    max_medium_tests_per_subject: int = 2
+    max_low_tests_per_subject: int = 1
+
     # Client-side pacing against the provider's tokens-per-minute cap. A batch
     # costs ~5,400 tokens, so only two fit Groq's free-tier 12,000 TPM window;
     # sending nine at once got most of them rejected *and* still charged them
@@ -107,6 +122,12 @@ class AppConfig:
     # remainder on a report that would be too incomplete to act on. 0 = start
     # whenever any budget at all remains.
     llm_min_tokens_to_start: int = 6000
+
+    # Compile a measure's DAX to SQL in Python and skip the LLM for it. This is
+    # the largest single token saving available, because SQL generation is
+    # ~97% of a run. Set False to force every query through the model, which is
+    # only useful when comparing the two.
+    compile_before_llm: bool = True
 
     # Optional machine-level default API keys per provider. Per-project
     # settings always take precedence over these.

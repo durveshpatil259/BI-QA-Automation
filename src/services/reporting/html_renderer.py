@@ -69,6 +69,47 @@ _TEMPLATE = """<!doctype html>
     <div class="card"><div class="n">{{ report.test_cases|length }}</div><div class="l">Test cases</div></div>
   </div>
 
+  {% set opt = tu.optimization or {} %}
+  {% if opt and opt.candidate_tests %}
+  <h2>Test selection</h2>
+  <p class="muted">
+    The suite is chosen, not enumerated. Every candidate below was generated
+    deterministically from the dashboard; what reaches this report is the
+    subset that proves something no other test already proves.
+  </p>
+  <div class="cards">
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.candidate_tests) }}</div><div class="l">Candidates generated</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.selected_tests) }}</div><div class="l">Selected</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.duplicates_removed) }}</div><div class="l">Duplicates removed</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.low_value_skipped) }}</div><div class="l">Low-value skipped</div></div>
+  </div>
+  {% if opt.by_priority %}
+  <p class="muted">
+    Selected by priority —
+    {% for name, count in opt.by_priority.items() %}
+      {{ name }}: <b>{{ count }}</b>{{ ", " if not loop.last }}
+    {% endfor %}.
+    High-priority data validation is never trimmed; the caps apply only to the
+    restatements around it.
+  </p>
+  {% endif %}
+
+  <h2>How much of this needed AI</h2>
+  <div class="cards">
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.compiled_without_llm) }}</div><div class="l">Computed by Python</div></div>
+    <div class="card"><div class="n">{{ '{:,}'.format(opt.plan_items) }}</div><div class="l">Validations in plan</div></div>
+    <div class="card"><div class="n">{{ opt.llm_calls }}</div><div class="l">LLM calls</div></div>
+    <div class="card"><div class="n">{{ '%.0f'|format(opt.compiled_pct) }}%</div><div class="l">Compiled, not generated</div></div>
+  </div>
+  <p class="muted">
+    A measure whose DAX Python can express is compiled directly to SQL and
+    never sent to a model — it is both cheaper and more trustworthy, because it
+    derives from what the dashboard computes rather than a restatement of it.
+    Every PASS/FAIL below was decided in Python by comparing numbers, never by
+    asking a model whether two values agree.
+  </p>
+  {% endif %}
+
   {% if tu and tu.total_tokens %}
   <h2>AI token usage</h2>
   <div class="cards">

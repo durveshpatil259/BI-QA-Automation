@@ -13,6 +13,7 @@ import time
 from src.core.logger import get_logger
 from src.domain.models import ValidationPlanItem
 from src.services.execution.base import ExecutionAdapter, ExecutionOutcome
+from src.services.validation import filter_spec
 from src.services.validation.sql_guard import double_percent_scaling, is_read_only
 
 _logger = get_logger()
@@ -43,7 +44,7 @@ class SqlServerAdapter(ExecutionAdapter):
         self._resolver = None
 
     # --- compile from DAX in preference to the model's SQL ----------------
-    def _compile(self, item: ValidationPlanItem):
+    def compile(self, item: ValidationPlanItem):
         """The measure's own DAX as T-SQL, or None when out of the grammar.
 
         Time-intelligence and ratio measures are where generated SQL goes wrong
@@ -65,10 +66,12 @@ class SqlServerAdapter(ExecutionAdapter):
         def filter_for(dataset: str):
             joins, clauses = [], []
             for raw in item.filters or []:
-                parsed = _FILTER.match(str(raw))
-                if not parsed:
-                    continue
-                f_table, f_column, _, f_value = parsed.groups()
+                parsed = filter_spec.parse(raw)
+                if parsed is None:
+                    # Never skip: a dropped filter turns a filtered measure
+                    # into the unfiltered total, which looks like a result.
+                    raise _CannotFilter(f"unrecognised filter {raw!r}")
+                f_table, f_column, f_value = parsed
                 located = resolver.column_filter_resolver()(
                     dataset, f_table, f_column, f"f{len(joins)}")
                 if located is None:
@@ -121,12 +124,17 @@ class SqlServerAdapter(ExecutionAdapter):
         # Prefer the compiled measure. It is derived from the model's own DAX
         # rather than restated by a model, so it cannot disagree with what the
         # dashboard computes.
-        compiled = self._compile(item) if item.item_type == "scalar" else None
+        compiled = self.compile(item) if item.item_type == "scalar" else None
         sql = item.generated_sql
         if compiled is not None:
             sql = compiled.sql
+            # Show BOTH the DAX and the SQL it became. The DAX alone says where
+            # the number came from but leaves a reader unable to reproduce it —
+            # and "compiled from DAX" reads as though no query ran at all. The
+            # query is the evidence; the DAX is why that query is the right one.
             outcome.evidence = (
-                f"Compiled from the model's own DAX: {compiled.description}"
+                f"Compiled from the model's own DAX: {compiled.description}\n"
+                f"{sql}"
             )
             _logger.info("Compiled '%s' from DAX instead of using generated SQL.",
                          item.kpi_name)

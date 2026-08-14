@@ -15,11 +15,24 @@
       "updated_at": "2026-08-13T17:33:10"
     },
     "Groq|llama-3.3-70b-versatile|458d24069d5a36f8": {
-      "date": "2026-08-13",
-      "tokens": 74099,
-      "calls": 14,
+      "date": "2026-08-14",
+      "tokens": 81498,
+      "calls": 16,
       "provider_remaining": null,
-      "updated_at": "2026-08-13T17:54:13"
+      "updated_at": "2026-08-14T14:43:43"
+    },
+    "Groq|llama-3.3-70b-versatile|155e7972254009e1": {
+      "date": "2026-08-13",
+      "tokens": 0,
+      "calls": 0,
+      "provider_remaining": null
+    },
+    "Groq|llama-3.3-70b-versatile|c465ceb186c713e5": {
+      "date": "2026-08-14",
+      "tokens": 54236,
+      "calls": 16,
+      "provider_remaining": null,
+      "updated_at": "2026-08-14T17:35:32"
     }
   }
 }

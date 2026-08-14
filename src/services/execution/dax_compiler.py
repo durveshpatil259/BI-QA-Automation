@@ -46,8 +46,25 @@ _ITERATORS = {"SUMX": "SUM", "AVERAGEX": "AVG", "MINX": "MIN", "MAXX": "MAX",
 _DATEADD = re.compile(
     r"DATEADD\s*\(\s*(?:'([^']+)'|(\w+))\s*\[\s*([^\]]+?)\s*\]\s*,\s*"
     r"(-?\d+)\s*,\s*(DAY|MONTH|QUARTER|YEAR)\s*\)", re.IGNORECASE)
+#: ``SAMEPERIODLASTYEAR(Calendar[date])`` — DAX defines this as exactly
+#: ``DATEADD(dates, -1, YEAR)``, so it reuses that builder rather than getting
+#: a second implementation that could drift from it.
+_SAME_PERIOD = re.compile(
+    r"SAMEPERIODLASTYEAR\s*\(\s*(?:'([^']+)'|(\w+))\s*\[\s*([^\]]+?)\s*\]\s*\)",
+    re.IGNORECASE)
 #: Time-intelligence table functions whose date range has a closed form.
 _TIME_INTEL = {"DATESMTD": "month", "DATESQTD": "quarter", "DATESYTD": "year"}
+#: ``TOTALYTD(expr, dates)`` is shorthand for ``CALCULATE(expr, DATESYTD(dates))``.
+#: Rewriting to the long form means one code path computes period-to-date,
+#: whichever spelling the model used.
+#:
+#: The anchor is the latest date in filter context — the whole calendar when
+#: nothing is filtered. On AdventureWorks that is 2021-06-30 while sales stop
+#: on 2020-06-15, so the unfiltered year-to-date window is legitimately empty
+#: and both this compiler and the PBIX evaluator return blank. That is what
+#: Power BI renders too; it is not a defect to compensate for.
+_TOTAL_PERIOD = {"TOTALYTD": "DATESYTD", "TOTALQTD": "DATESQTD",
+                 "TOTALMTD": "DATESMTD"}
 #: A bare measure reference: ``[Total Sales]``
 _MEASURE_REF = re.compile(r"^\[([^\]]+)\]$")
 #: A column reference inside a calculated-column formula.
@@ -306,6 +323,22 @@ class _Compiler:
                             f"{alternate})")
             return f"({numerator} / NULLIF({denominator}, 0))"
 
+        # TOTALYTD(expr, dates) -> CALCULATE(expr, DATESYTD(dates)). Rewritten
+        # rather than reimplemented so the period logic has one home.
+        for name, dates_fn in _TOTAL_PERIOD.items():
+            if upper.startswith(name + "(") and expr.endswith(")"):
+                args = _split_args(expr[len(name) + 1:-1])
+                if len(args) < 2:
+                    return None
+                if len(args) > 2:
+                    # The optional third argument is an extra filter; keep it
+                    # rather than silently computing an unfiltered figure.
+                    extra = ", " + ", ".join(args[2:])
+                else:
+                    extra = ""
+                return self._calculate(
+                    f"CALCULATE({args[0]}, {dates_fn}({args[1]}){extra})", depth)
+
         if upper.startswith("CALCULATE(") and expr.endswith(")"):
             return self._calculate(expr, depth)
 
@@ -435,6 +468,11 @@ class _Compiler:
             if match:
                 return self._period_to_date(match.group(1) or match.group(2),
                                             match.group(3), unit)
+        same = _SAME_PERIOD.fullmatch(text)
+        if same:
+            return self._shifted_period(same.group(1) or same.group(2),
+                                        same.group(3), "-1", "year")
+
         shifted = _DATEADD.fullmatch(text)
         if shifted:
             return self._shifted_period(shifted.group(1) or shifted.group(2),

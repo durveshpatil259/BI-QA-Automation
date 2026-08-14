@@ -764,6 +764,10 @@ class ValidationPlan(SerializableMixin):
     #: skips its remaining AI stages on this, and the reason changes what the
     #: user should do — wait for the reset, not investigate a failure.
     budget_exhausted: bool = False
+    #: KPIs whose SQL Python compiled from DAX, so the model was never asked.
+    compiled_items: int = 0
+    #: LLM round-trips that actually happened, for the optimisation report.
+    llm_calls: int = 0
 
     @property
     def is_complete(self) -> bool:

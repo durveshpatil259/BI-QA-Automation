@@ -14,6 +14,7 @@ from src.services.extractors.power_bi.pbixray_extractor import (
     PbixRayExtractor,
     pbixray_available,
 )
+from src.services.extractors.tableau import TableauExtractor
 from src.services.extractors.unsupported import PendingExtractor
 
 _logger = get_logger()
@@ -91,11 +92,29 @@ class BestPowerBIExtractor(MetadataExtractor):
         )
 
 
+def create_extractor_for_file(file_path, fallback: BIPlatform) -> MetadataExtractor:
+    """Route by what the file *is*, falling back to the project's platform.
+
+    A Tableau workbook uploaded to a Power BI project used to reach the Power
+    BI parser, which reads no model from it; the pipeline then treated the
+    result as a dashboard with nothing to validate and reported success.
+    """
+    from src.services.extractors.file_detector import detect_platform
+
+    detected = detect_platform(file_path)
+    if detected and detected != fallback:
+        _logger.info("File %s looks like %s, not %s — routing to the %s adapter.",
+                     Path(file_path).name, detected, fallback, detected)
+    return create_extractor(detected or fallback)
+
+
 def create_extractor(platform: BIPlatform) -> MetadataExtractor:
     if platform == BIPlatform.POWER_BI:
         return BestPowerBIExtractor()
     if platform == BIPlatform.TABLEAU:
-        return PendingExtractor(BIPlatform.TABLEAU, "Module 5b")
+        # A dedicated extractor rather than the generic placeholder, so the
+        # refusal names the actual format and what it would need.
+        return TableauExtractor()
     if platform == BIPlatform.QLIK:
         return PendingExtractor(BIPlatform.QLIK, "Module 5c")
     if platform == BIPlatform.MICROSTRATEGY:

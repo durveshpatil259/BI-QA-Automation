@@ -51,6 +51,8 @@ class PipelineContext:
     #: Tokens consumed by this run, broken down by stage.
     usage: UsageAccumulator = field(default_factory=UsageAccumulator, repr=False)
 
+    #: Deduplication counters from test expansion, for the report.
+    dedup_stats: object | None = None
     #: The key's daily budget as it stood when the run started.
     budget_status: object | None = None
     #: Set when the daily budget ran out mid-run. Later AI stages are skipped

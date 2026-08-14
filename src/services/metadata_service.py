@@ -13,7 +13,7 @@ from pathlib import Path
 from src.core.exceptions import MetadataExtractionError
 from src.core.logger import get_logger
 from src.domain.models import DashboardMetadata, Project
-from src.services.extractors import create_extractor
+from src.services.extractors import create_extractor_for_file
 from src.storage.project_repository import ProjectRepository
 
 _logger = get_logger()
@@ -50,7 +50,9 @@ class MetadataService:
     def extract(self, project: Project) -> DashboardMetadata:
         """Extract metadata from the project's primary dashboard file and save."""
         source = self._select_primary_file(project)
-        extractor = create_extractor(project.bi_platform)
+        # Route on the file itself: the project's platform is what the
+        # user selected, which is not necessarily what they uploaded.
+        extractor = create_extractor_for_file(source, project.bi_platform)
         _logger.info(
             "Extracting metadata: project=%s platform=%s file=%s",
             project.id, project.bi_platform, source.name,

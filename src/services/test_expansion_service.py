@@ -202,11 +202,35 @@ class TestExpansionService:
             return [(m.name, "") for m in md.all_measures[:20] if m.name]
         return []
 
+    #: Visuals that plot no data of their own, so a chart-test template proves
+    #: nothing about them. Cards are already covered by the KPI tests and
+    #: slicers by the filter tests; textboxes and buttons carry no data at all.
+    #: On a real report these were 37 of 58 visuals — two thirds of the chart
+    #: suite was testing things that are not charts.
+    _NON_DATA_VISUALS = {
+        "card", "cardvisual", "kpi", "kpicard", "multirowcard", "slicer",
+        "textbox", "shape", "image", "actionbutton", "button",
+    }
+
+    def _is_chart(self, visual) -> bool:
+        """Whether a grouped data validation would prove anything about it.
+
+        Delegates to the platform-neutral classifier so the same rule holds for
+        any BI platform: a card is validated as a KPI and a slicer as a filter,
+        so testing either as a chart duplicates coverage it already has.
+        """
+        from src.domain.bi_report import VisualKind, classify_visual
+
+        return classify_visual(
+            getattr(visual, "visual_type", "")) in VisualKind.DATA_KINDS
+
     def _charts(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
         if ext and ext.visuals:
-            return [(v.title or v.visual_type or "visual") for v in ext.visuals]
+            return [(v.title or v.visual_type or "visual")
+                    for v in ext.visuals if self._is_chart(v)]
         if md:
-            return [(v.title or v.id or "visual") for v in md.all_visuals]
+            return [(v.title or v.id or "visual")
+                    for v in md.all_visuals if self._is_chart(v)]
         return []
 
     def _filters(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
@@ -259,14 +283,37 @@ class TestExpansionService:
         # 6) Report-level QA (pages + security)
         cases.extend(self._report_qa_cases(md))
 
+        # The steps above are a cross-product — every template against every
+        # KPI, chart and filter — which restates the same check many times.
+        # Collapsing by what each test *proves* is what turns that into a suite
+        # a reviewer can actually read.
+        from src.services.validation.test_dedup import deduplicate
+
+        from src.core.config import load_config
+
+        cfg = load_config()
+        cases, stats = deduplicate(
+            cases,
+            max_high_per_subject=int(getattr(cfg, "max_high_tests_per_subject", 3)),
+            max_medium_per_subject=int(getattr(cfg, "max_medium_tests_per_subject", 2)),
+            max_low_per_subject=int(getattr(cfg, "max_low_tests_per_subject", 1)),
+        )
+        self._last_stats = stats
+
         self._repo.save_test_cases(project, cases)
         _logger.info(
-            "Expanded %d test cases for %s (QA=%d, Dev=%d)",
+            "Expanded %d test cases for %s (QA=%d, Dev=%d) | %s",
             len(cases), project.id,
             sum(1 for c in cases if c.kind == TestCaseKind.QA),
             sum(1 for c in cases if c.kind == TestCaseKind.UNIT),
+            stats.describe(),
         )
         return cases
+
+    @property
+    def last_stats(self):
+        """Deduplication counters from the most recent expand(), or None."""
+        return getattr(self, "_last_stats", None)
 
     # --- builders ---------------------------------------------------------
     @staticmethod

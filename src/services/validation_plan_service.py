@@ -26,6 +26,7 @@ from src.services.llm import create_client
 from src.services.llm.base import LLMClient
 from src.services.llm.json_utils import extract_json
 from src.services.llm.prompt_builder import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
+from src.services.validation import filter_spec
 from src.services.validation.filter_reach import filter_applies
 from src.services.validation.sql_guard import is_read_only
 from src.services.validation.sql_repair import repair_sql
@@ -52,6 +53,89 @@ class ValidationPlanService:
         return self._repo.load_validation_plan(project)
 
     # --- inputs -----------------------------------------------------------
+    def _precompile(self, project, scenarios, model_meta, schema):
+        """Split the work: what Python can compute, and what the model must write.
+
+        Returns ``(items, remaining_scenarios, compiled_count)``. A KPI whose
+        DAX compiles is turned into a finished plan item here and stripped from
+        the scenarios, so it never appears in a prompt. A scenario left with no
+        KPIs and no visuals disappears entirely, which is what removes whole
+        batches rather than just shortening them.
+        """
+        from src.core.config import load_config
+
+        if not model_meta or not getattr(load_config(), "compile_before_llm", True):
+            return [], scenarios, 0
+
+        adapter = self._compiler_adapter(project, model_meta, schema)
+        if adapter is None:
+            return [], scenarios, 0
+
+        items: list[ValidationPlanItem] = []
+        remaining: list[dict] = []
+        compiled = 0
+        for scenario in scenarios:
+            kept_kpis = []
+            for kpi in scenario.get("kpis", []):
+                name = kpi[0] if isinstance(kpi, (list, tuple)) else str(kpi)
+                # Canonical string form, the same shape the model's own plan
+                # items use, so one filter parser serves both paths.
+                scenario_filters = filter_spec.normalise_all(
+                    scenario.get("filters"))
+                probe = ValidationPlanItem(
+                    kpi_name=name, item_type="scalar", filters=scenario_filters,
+                )
+                try:
+                    result = adapter.compile(probe)
+                except Exception as exc:  # noqa: BLE001 - never block generation
+                    _logger.info("Compile probe failed for '%s': %s", name, exc)
+                    result = None
+                if result is None:
+                    kept_kpis.append(kpi)
+                    continue
+                compiled += 1
+                items.append(ValidationPlanItem(
+                    kpi_name=name,
+                    scenario=scenario.get("label", ""),
+                    view_name=scenario.get("view_name", ""),
+                    dashboard_value=(kpi[1] if isinstance(kpi, (list, tuple))
+                                     and len(kpi) > 1 else ""),
+                    filters=scenario_filters,
+                    generated_sql=result.sql,
+                    business_meaning=f"Compiled from DAX: {result.description}",
+                    confidence=1.0,
+                    item_type="scalar",
+                ))
+            scenario = dict(scenario, kpis=kept_kpis)
+            if kept_kpis or scenario.get("visuals"):
+                remaining.append(scenario)
+
+        if compiled:
+            _logger.info(
+                "Compiled %d KPI validation(s) from DAX; %d scenario(s) still "
+                "need the model (was %d).", compiled, len(remaining), len(scenarios),
+            )
+        return items, remaining, compiled
+
+    def _compiler_adapter(self, project, model_meta, schema):
+        """An execution adapter used only to ask 'can this be compiled?'."""
+        try:
+            config = self._repo.load_datasource(project)
+            if config is None or not config.is_configured:
+                return None
+            if config.type in (DatasourceType.EXCEL, DatasourceType.CSV):
+                from src.services.execution.file_adapter import build_file_adapter
+
+                return build_file_adapter(config, model_meta)
+            from src.services.datasources import create_connector
+            from src.services.execution.sql_adapter import SqlServerAdapter
+
+            # No connection is opened: compile() only reads metadata and schema.
+            return SqlServerAdapter(create_connector(config), schema, model_meta)
+        except Exception as exc:  # noqa: BLE001 - compilation is an optimisation
+            _logger.info("No compiler adapter available: %s", exc)
+            return None
+
     def _collect_targets(self, project: Project) -> list[tuple[str, str, str]]:
         """Return [(kpi_name, displayed_value, dax)] for the AI to map.
 
@@ -166,9 +250,17 @@ class ValidationPlanService:
 
         max_scenarios = int(getattr(_load_cfg(), 'max_scenarios',
                                     self.MAX_SCENARIOS) or self.MAX_SCENARIOS)
+        # Representative selection, not the full cross-product. Validating
+        # every value of every slicer re-proves one thing many times: if a
+        # measure recalculates correctly for FY2018 it does so for FY2019 by
+        # the same code path. What is worth checking is that *each slicer*
+        # filters at all, so one value per slicer is taken — the first, which
+        # is the shortest list and therefore the most distinctive.
+        per_slicer = max(1, int(getattr(_load_cfg(), "values_per_slicer", 1) or 1))
         index = 2
+        skipped = 0
         for option in options:
-            for value in option.values:
+            for value in option.values[:per_slicer]:
                 if index > max_scenarios:
                     break
                 try:
@@ -190,8 +282,14 @@ class ValidationPlanService:
                     "visuals": [],
                 })
                 index += 1
+            skipped += max(0, len(option.values) - per_slicer)
             if index > max_scenarios:
                 break
+        if skipped:
+            _logger.info(
+                "Slicer coverage: one representative value per slicer; "
+                "%d further value(s) skipped as re-proving the same path.", skipped,
+            )
 
         _logger.info(
             "Built %d data-backed scenario(s) with real expected values", len(scenarios)
@@ -555,6 +653,14 @@ class ValidationPlanService:
         )
 
 
+        # Compile first, ask second. Every KPI whose DAX Python can express is
+        # removed from the scenarios before batching, so the model is never
+        # asked for SQL that already exists — the single largest saving
+        # available, because SQL generation is ~97% of a run's token cost.
+        precompiled, scenarios, compiled_count = self._precompile(
+            project, scenarios, model_meta, schema
+        )
+
         # One call per batch: asking for 30+ queries at once reliably overflows
         # the output budget and truncates the JSON mid-object.
         batch_size = int(getattr(load_config(), 'max_items_per_call',
@@ -565,6 +671,9 @@ class ValidationPlanService:
         errors: list[str] = []
         budget_exhausted = False
         model_name = client.model
+
+        if not batches and precompiled:
+            _logger.info("Every KPI compiled from DAX — no LLM call needed.")
 
         for index, batch in enumerate(batches, start=1):
             cancellation.raise_if_cancelled()
@@ -611,6 +720,8 @@ class ValidationPlanService:
                 errors.append(f"batch {index}: {exc}")
                 _logger.warning("Plan batch %d/%d unparseable: %s", index, len(batches), exc)
 
+        # Compiled items count as generated: they are finished plan items.
+        items = precompiled + items
         if not items:
             if budget_exhausted:
                 # Nothing was generated *and* the key is spent: re-raise so the
@@ -641,6 +752,8 @@ class ValidationPlanService:
             batches_ok=len(raw_parts),
             errors=errors,
             budget_exhausted=budget_exhausted,
+            compiled_items=compiled_count,
+            llm_calls=len(raw_parts),
         )
         if not plan.is_complete:
             _logger.warning("Validation plan INCOMPLETE: %s", plan.coverage_note())

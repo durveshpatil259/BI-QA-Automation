@@ -245,13 +245,20 @@ class PipelineRunner:
 
     def _generate_tests(self, ctx: PipelineContext) -> str:
         ctx.test_cases = self._s.test_expansion_service.expand(ctx.project)
-        return f"{len(ctx.test_cases)} test case(s)"
+        # Kept for the report's optimisation section: how many candidates were
+        # generated and what was removed is the evidence that the suite is
+        # deliberately compact rather than accidentally thin.
+        ctx.dedup_stats = getattr(self._s.test_expansion_service, "last_stats", None)
+        stats = ctx.dedup_stats
+        suffix = f" ({stats.describe()})" if stats else ""
+        return f"{len(ctx.test_cases)} test case(s){suffix}"
 
     def _build_report(self, ctx: PipelineContext) -> str:
         token_usage = ctx.usage.to_dict()
         # The reader needs to know a short report was short *because the key
         # ran out*, not because the dashboard had little to check.
         token_usage["budget_exhausted"] = ctx.budget_exhausted
+        token_usage["optimization"] = self._optimization(ctx)
         if ctx.budget_status is not None:
             token_usage["daily_budget"] = ctx.budget_status.to_dict()
         ctx.report = self._s.report_service.build_report(
@@ -268,6 +275,33 @@ class PipelineRunner:
             _logger.info("  %-28s %6s tokens over %d call(s)",
                          entry.stage, f"{entry.total_tokens:,}", entry.calls)
         return f"Report {ctx.report.id}{suffix}"
+
+    @staticmethod
+    def _optimization(ctx: PipelineContext) -> dict:
+        """What the run chose not to do, and why that was cheaper.
+
+        Every figure here is counted during the run rather than estimated:
+        compiled KPIs never reached a prompt, duplicates were fingerprinted
+        away, and low-value tests were capped per subject.
+        """
+        stats = getattr(ctx, "dedup_stats", None)
+        plan = ctx.validation_plan
+        data = {
+            "candidate_tests": getattr(stats, "original", 0),
+            "selected_tests": getattr(stats, "kept", 0),
+            "duplicates_removed": getattr(stats, "duplicates_removed", 0),
+            "low_value_skipped": getattr(stats, "low_value_skipped", 0),
+            "by_priority": dict(getattr(stats, "by_priority", {}) or {}),
+            "compiled_without_llm": getattr(plan, "compiled_items", 0),
+            "llm_calls": getattr(plan, "llm_calls", 0),
+            "plan_items": len(plan.items) if plan else 0,
+        }
+        total = data["compiled_without_llm"] + data["plan_items"]
+        data["compiled_pct"] = (
+            round(100 * data["compiled_without_llm"] / data["plan_items"], 0)
+            if data["plan_items"] else 0
+        )
+        return data
 
     # --- helpers ----------------------------------------------------------
     def _settings(self, ctx: PipelineContext) -> LLMSettings:

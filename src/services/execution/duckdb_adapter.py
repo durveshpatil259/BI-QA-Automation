@@ -22,6 +22,7 @@ from src.core.logger import get_logger
 from src.domain.models import DatasourceConfig, ValidationPlanItem
 from src.services.execution.base import ExecutionAdapter, ExecutionOutcome
 from src.services.execution.source_bundle import SourceBundle
+from src.services.validation import filter_spec
 
 _logger = get_logger()
 
@@ -157,7 +158,7 @@ class DuckDbAdapter(ExecutionAdapter):
             )
         return None
 
-    def _compile(self, item: ValidationPlanItem):
+    def compile(self, item: ValidationPlanItem):
         """Compile the measure's DAX to SQL over the source, or None."""
         from src.services.execution.dax_compiler import compile_measure
 
@@ -347,11 +348,11 @@ class DuckDbAdapter(ExecutionAdapter):
         not_applicable: list[str] = []
 
         for raw in item.filters or []:
-            parsed = _FILTER.match(str(raw))
-            if not parsed:
+            parsed = filter_spec.parse(raw)
+            if parsed is None:
                 unapplied.append(str(raw))
                 continue
-            f_table, f_column, _, f_value = parsed.groups()
+            f_table, f_column, f_value = parsed
             # A filter the model would not propagate here leaves this dataset
             # unchanged — the dashboard's own behaviour, not a failure.
             if not self._filter_reaches(f_table, dataset):
@@ -439,7 +440,7 @@ class DuckDbAdapter(ExecutionAdapter):
         # Python does the arithmetic, so nothing is delegated to a model.
         mismatch = self._verify_against_dax(item)
         if mismatch:
-            compiled = self._compile(item)
+            compiled = self.compile(item)
             if compiled is None:
                 outcome.error = mismatch
                 return outcome
@@ -451,7 +452,7 @@ class DuckDbAdapter(ExecutionAdapter):
             # The measure looks simple but its column is calculated, so it does
             # not exist in the source. The compiler can expand the formula —
             # including RELATED() lookups — so try that before giving up.
-            compiled = self._compile(item)
+            compiled = self.compile(item)
             if compiled is not None:
                 return self._run_compiled(item, compiled)
             outcome.error = (

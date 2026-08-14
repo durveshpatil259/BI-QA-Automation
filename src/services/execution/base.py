@@ -50,6 +50,21 @@ class ExecutionAdapter(abc.ABC):
     def is_ready(self) -> tuple[bool, str]:
         """(usable, reason). Reason explains what to fix when not usable."""
 
+    def compile(self, item: ValidationPlanItem):
+        """The measure computed from its own DAX, or None if out of grammar.
+
+        Asked *before* generation, not just at execution: a measure Python can
+        compile never needs to reach the model at all. On a real dashboard that
+        removed two thirds of the SQL-generation work — the single largest
+        source of token spend — and the compiled form is more trustworthy than
+        the generated one, because it derives from what the dashboard actually
+        computes rather than a restatement of it.
+
+        Adapters that cannot compile simply return None and everything falls
+        through to the LLM exactly as before.
+        """
+        return None
+
     @abc.abstractmethod
     def execute_scalar(self, item: ValidationPlanItem) -> ExecutionOutcome:
         """Compute one number for a KPI item."""
