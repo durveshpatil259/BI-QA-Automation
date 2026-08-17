@@ -122,8 +122,73 @@ class Project(SerializableMixin):
 
     last_analysis_at: _dt.datetime | None = None
 
+    # --- project-management fields (dashboard layer) ---------------------
+    #: Which environment the dashboard under test belongs to. Recorded rather
+    #: than acted on: a failure in Production reads very differently from the
+    #: same failure in Development, and the reader needs that context.
+    environment: str = ""
+    #: Wall-clock duration of the last completed run, for the dashboard's
+    #: average-processing-time figure.
+    processing_time_ms: int | None = None
+
     def touch(self) -> None:
         self.updated_at = _now()
+
+
+@dataclass
+class RunSummary(SerializableMixin):
+    """A small, flat record of one completed run.
+
+    The dashboard aggregates across every project. Reading each project's full
+    validation and test-case files to do that means opening several megabytes
+    to produce a handful of integers, and it gets slower with every project
+    analysed. This is written once when a run finishes so the dashboard reads
+    one small file per project instead.
+
+    Deliberately denormalised and self-contained: it is a snapshot of what was
+    true at the end of that run, not a view that has to be recomputed.
+    """
+
+    project_id: str = ""
+    project_name: str = ""
+    status: str = ""
+    generated_at: _dt.datetime = field(default_factory=_now)
+    processing_time_ms: int | None = None
+
+    # what the dashboard was made of
+    pages: int = 0
+    visuals: int = 0
+    measures: int = 0
+    tables: int = 0
+    relationships: int = 0
+
+    # what was executed
+    tests_total: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_warning: int = 0
+    tests_skipped: int = 0
+
+    # what was generated
+    test_cases: int = 0
+    candidates: int = 0
+    duplicates_removed: int = 0
+    low_value_skipped: int = 0
+
+    # what was found, by how much it matters
+    issues_high: int = 0
+    issues_medium: int = 0
+    issues_low: int = 0
+
+    # what it cost
+    tokens: int = 0
+    llm_calls: int = 0
+    compiled_without_llm: int = 0
+
+    @property
+    def issues(self) -> int:
+        """Findings a reviewer has to act on."""
+        return self.tests_failed + self.tests_warning
 
 
 # ===========================================================================
@@ -344,6 +409,12 @@ class TestCase(SerializableMixin):
     status: TestStatus = TestStatus.NOT_EXECUTED
     priority: Priority = Priority.MEDIUM
     remarks: str = ""
+    #: Whether anything this tool runs could decide this test. False means it
+    #: describes work for a person — hovering, clicking, timing, exporting —
+    #: and "Not Executed" is its finished state, not a gap in coverage. Kept on
+    #: the case so a report can separate the two rather than counting manual
+    #: work as failed automation.
+    automatable: bool = True
 
     # --- data-validation columns (populated for SQL validation tests) ------
     generated_sql: str = ""

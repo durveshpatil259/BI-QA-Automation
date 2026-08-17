@@ -73,12 +73,16 @@ def create_app() -> FastAPI:
             },
         )
 
-    from src.api.routers import analysis, projects, reports, settings
+    from src.api.routers import (adminviews, analysis, dashboard, projects, reports,
+                             settings, testviews)
 
     app.include_router(projects.router)
     app.include_router(analysis.router)
     app.include_router(reports.router)
     app.include_router(settings.router)
+    app.include_router(dashboard.router)
+    app.include_router(testviews.router)
+    app.include_router(adminviews.router)
 
     @app.get("/api/health", tags=["meta"])
     def health():

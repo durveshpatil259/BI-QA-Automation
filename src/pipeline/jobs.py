@@ -132,7 +132,36 @@ class JobManager:
                 _logger.warning("job=%s failed: %s", job.id, exc)
             finally:
                 job.finished_at = _dt.datetime.now()
+                # The run's own duration is only known here, where the job is
+                # timed. The dashboard averages it across projects, so it has
+                # to reach disk rather than staying in this process.
+                self._persist_duration(ctx, job)
                 loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+
+    @staticmethod
+    def _persist_duration(ctx, job) -> None:
+        """Record how long the run took on the project record."""
+        try:
+            if ctx is None or ctx.project is None or job.finished_at is None:
+                return
+            elapsed = int((job.finished_at - job.created_at).total_seconds() * 1000)
+            from src.core.config import load_config
+            from src.storage.project_repository import ProjectRepository
+
+            repo = ProjectRepository(load_config().projects_root_path)
+            project = repo.load(ctx.project.id)
+            project.processing_time_ms = elapsed
+            repo.save(project)
+
+            # The runner writes the summary before this point, so it cannot
+            # know the duration. Patch it here rather than move summary writing
+            # into the job layer, which would couple it to the web API.
+            summary = repo.load_run_summary(project)
+            if summary is not None:
+                summary.processing_time_ms = elapsed
+                repo.save_run_summary(project, summary)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never fatal
+            _logger.info("Could not record run duration: %s", exc)
 
     # --- queries ----------------------------------------------------------
     def get(self, job_id: str) -> Job | None:

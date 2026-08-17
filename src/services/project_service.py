@@ -55,6 +55,7 @@ class ProjectService:
         name: str,
         bi_platform: BIPlatform | str,
         description: str = "",
+        environment: str = "",
     ) -> Project:
         """Validate inputs and create a new project on disk."""
         name = self._validate_name(name)
@@ -66,7 +67,8 @@ class ProjectService:
                 f"A project named '{name}' already exists. Choose a different name."
             )
 
-        project = Project(name=name, description=description, bi_platform=platform)
+        project = Project(name=name, description=description, bi_platform=platform,
+                          environment=(environment or '').strip())
         self._repo.create(project)
         _logger.info("Project created: %s (%s)", project.name, project.id)
         return project

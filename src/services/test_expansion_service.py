@@ -71,6 +71,14 @@ class _Evidence:
             )
         return TestStatus.PASS, f"Proven by executed SQL validation(s): {ids}{more}"
 
+    #: The only test types anything here can decide. Everything else needs a
+    #: rendered Power BI report — hovering, clicking, timing, exporting — which
+    #: this tool never opens: it reads a file and queries a database.
+    AUTOMATABLE = frozenset({
+        "Value Validation", "Filter Validation", "Format Validation",
+        "Chart Validation",
+    })
+
     # --- what each template type may inherit ------------------------------
     def resolve(self, test_type: str):
         """(status, remark) if the SQL run proves this test, else None."""
@@ -225,13 +233,18 @@ class TestExpansionService:
             getattr(visual, "visual_type", "")) in VisualKind.DATA_KINDS
 
     def _charts(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
-        if ext and ext.visuals:
-            return [(v.title or v.visual_type or "visual")
-                    for v in ext.visuals if self._is_chart(v)]
-        if md:
-            return [(v.title or v.id or "visual")
-                    for v in md.all_visuals if self._is_chart(v)]
-        return []
+        """[(display name, [lookup aliases])] for every data-bearing visual."""
+        source = (ext.visuals if ext and ext.visuals
+                  else (md.all_visuals if md else []))
+        out = []
+        for v in source:
+            if not self._is_chart(v):
+                continue
+            aliases = self._chart_aliases(v)
+            display = (getattr(v, "title", "") or (aliases[-1] if aliases else "")
+                       or getattr(v, "id", "") or "visual")
+            out.append((display, aliases))
+        return out
 
     def _filters(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
         if ext and ext.filters:
@@ -242,7 +255,16 @@ class TestExpansionService:
         return []
 
     # --- expansion --------------------------------------------------------
-    def expand(self, project: Project) -> list[TestCase]:
+    def expand(
+        self, project: Project, dax_values: dict[str, str] | None = None
+    ) -> list[TestCase]:
+        """Build the suite.
+
+        ``dax_values`` is the output of the DAX evaluation stage. It is passed
+        in rather than reloaded because it is a pipeline artefact, not stored
+        state; without it the model checks still run, they just cannot confirm
+        that a measure computes.
+        """
         ext = self._repo.load_dashboard_extraction(project)
         md = self._repo.load_metadata(project)
         run = self._repo.load_data_validation(project)
@@ -265,8 +287,8 @@ class TestExpansionService:
                 _KPI_DEV, TestCaseKind.UNIT, f"KPI: {name}", name, value, ev))
 
         # 3) Chart tests (QA + Dev)
-        for name in self._charts(ext, md):
-            ev = evidence.get(name.casefold())
+        for name, aliases in self._charts(ext, md):
+            ev = next((evidence[a] for a in aliases if a in evidence), None)
             cases.extend(self._from_templates(
                 _CHART_QA, TestCaseKind.QA, f"Chart: {name}", name, "", ev))
             cases.extend(self._from_templates(
@@ -277,8 +299,9 @@ class TestExpansionService:
             cases.extend(self._from_templates(
                 _FILTER_QA, TestCaseKind.QA, "Filters", name, ""))
 
-        # 5) Model developer tests (from metadata)
-        cases.extend(self._model_dev_cases(md))
+        # 5) Model developer tests (from metadata), executed where decidable
+        cases.extend(self._model_dev_cases(
+            md, dax_values or {}, self._repo.load_db_schema(project)))
 
         # 6) Report-level QA (pages + security)
         cases.extend(self._report_qa_cases(md))
@@ -318,16 +341,41 @@ class TestExpansionService:
     # --- builders ---------------------------------------------------------
     @staticmethod
     def _index_evidence(run: DataValidationRun | None) -> dict[str, _Evidence]:
-        """Executed validations grouped by the KPI / chart they exercised."""
+        """Executed validations, indexed under every name they answer to.
+
+        A chart is named differently on each side: the validation engine labels
+        it ``pieChart by Business Type`` (built from type and dimension), while
+        a test case is keyed by the visual's title — which is usually absent in
+        a .pbix, leaving the raw id. Indexing one identity meant the two never
+        met, and 95 chart tests reported as unexecuted even where the matching
+        validation had run and passed.
+        """
         index: dict[str, _Evidence] = {}
         if not run:
             return index
         for result in run.results:
-            key = (result.visual_title or result.kpi_name or "").casefold()
-            if not key:
-                continue
-            index.setdefault(key, _Evidence()).add(result)
+            evidence = None
+            for name in (result.visual_title, result.kpi_name):
+                key = (name or "").casefold().strip()
+                if not key:
+                    continue
+                evidence = evidence or index.setdefault(key, _Evidence())
+                index.setdefault(key, evidence)
+            if evidence is not None:
+                evidence.add(result)
         return index
+
+    @staticmethod
+    def _chart_aliases(visual) -> list[str]:
+        """Every name a chart may be filed under, most specific first."""
+        vtype = (getattr(visual, "visual_type", "") or "").strip()
+        names = [getattr(visual, "title", ""), getattr(visual, "id", "")]
+        # The label the validation engine builds when a visual has no title.
+        for field in (getattr(visual, "fields", None) or []):
+            leaf = str(field).rsplit(".", 1)[-1]
+            if vtype and leaf:
+                names.append(f"{vtype} by {leaf}")
+        return [n.casefold().strip() for n in names if n]
 
     @staticmethod
     def _from_templates(
@@ -342,6 +390,7 @@ class TestExpansionService:
                       "Auto-generated; execute manually or via automation.")
             )
             out.append(TestCase(
+                automatable=ttype in _Evidence.AUTOMATABLE,
                 kind=kind, module=module,
                 test_scenario=f"[{ttype}] " + scenario.format(n=name, v=value or "—"),
                 test_steps=steps.format(n=name, v=value or "—"),
@@ -381,37 +430,61 @@ class TestExpansionService:
             ))
         return out
 
-    def _model_dev_cases(self, md: DashboardMetadata | None) -> list[TestCase]:
+    def _model_dev_cases(
+        self, md: DashboardMetadata | None, dax_values: dict, db_schema
+    ) -> list[TestCase]:
+        """Developer tests over the model, each carrying a real verdict.
+
+        Every check here is answered from the metadata, the evaluated measure
+        values and the datasource schema, so these arrive executed. Only the
+        performance test stays manual — nothing in this process observes render
+        time, and inventing a verdict for it would be worse than admitting it.
+        """
         if not md:
             return []
+        from src.services.validation import model_checks as checks
+
         out: list[TestCase] = []
         for t in md.tables:
+            r = checks.check_dataset(t, db_schema)
             out.append(self._dev(f"Dataset: {t.name}", "Dataset Test",
-                f"Validate dataset '{t.name}' loads with expected columns/rows",
-                f"1. Refresh '{t.name}'.\n2. Verify column count and row count.",
-                "Dataset refresh", "Dataset loads with expected schema and rows.",
-                Priority.HIGH))
+                f"Validate dataset '{t.name}' resolves with its expected columns",
+                f"1. Read the columns of '{t.name}' from the model.\n"
+                "2. Identify the source table that backs it.",
+                "Model schema + datasource schema",
+                "The table has columns and maps to a source table.",
+                Priority.HIGH, result=r))
         for m in md.all_measures:
+            r = checks.check_measure(m, dax_values)
             out.append(self._dev(f"Measure: {m.table}[{m.name}]", "Measure Test",
-                f"Validate measure '{m.name}' returns correct results",
-                "1. Evaluate the measure for known inputs.",
-                "Known dataset", "Measure returns the expected value.", Priority.HIGH))
+                f"Validate measure '{m.name}' computes a result",
+                "1. Evaluate the measure against the model's own data.\n"
+                "2. Confirm it returns a value.",
+                f"{m.table}[{m.name}]", "The measure evaluates to a value.",
+                Priority.HIGH, result=r))
             if m.dax_expression:
+                r = checks.check_dax(m, md)
                 out.append(self._dev(f"Measure: {m.table}[{m.name}]", "DAX Test",
-                    f"Validate DAX for measure '{m.name}'",
-                    "1. Review DAX for context, filters, div-by-zero.",
-                    m.dax_expression[:120], "DAX is correct and edge-case safe.",
-                    Priority.MEDIUM))
-        for r in md.relationships:
+                    f"Validate DAX references for measure '{m.name}'",
+                    "1. Parse every Table[Column] and [Measure] reference.\n"
+                    "2. Resolve each one against the model.",
+                    m.dax_expression[:120],
+                    "Every referenced table, column and measure exists.",
+                    Priority.MEDIUM, result=r))
+        for rel in md.relationships:
+            r = checks.check_relationship(rel, md)
             out.append(self._dev("Relationships", "Relationship Test",
-                f"Validate relationship {r.from_table}->{r.to_table}",
-                "1. Verify cardinality, cross-filter direction and referential integrity.",
-                f"{r.cardinality}, {r.cross_filter_direction}, active={r.is_active}",
-                "Relationship is correct and keys are consistent.", Priority.HIGH))
+                f"Validate relationship {rel.from_table}->{rel.to_table}",
+                "1. Resolve both endpoint columns against the model.\n"
+                "2. Check the relationship is active.",
+                f"{rel.cardinality}, {rel.cross_filter_direction}, active={rel.is_active}",
+                "Both endpoints exist and the relationship is active.",
+                Priority.HIGH, result=r))
         out.append(self._dev("Performance", "Performance Test",
             "Validate overall model/report performance",
             "1. Measure page load and visual render times under load.",
-            "Performance run", "Report meets the performance budget.", Priority.MEDIUM))
+            "Performance run", "Report meets the performance budget.",
+            Priority.MEDIUM))
         return out
 
     def _report_qa_cases(self, md: DashboardMetadata | None) -> list[TestCase]:
@@ -427,6 +500,7 @@ class TestExpansionService:
             test_data="RLS roles", expected_result="Each role sees only permitted data.",
             status=TestStatus.NOT_EXECUTED, priority=Priority.HIGH,
             remarks="Auto-generated; requires RLS roles configured.",
+            automatable=False,
         ))
         return out
 
@@ -438,4 +512,8 @@ class TestExpansionService:
             test_data=tdata, expected_result=expected,
             status=TestStatus.NOT_EXECUTED, priority=priority,
             remarks="Auto-generated developer test.",
+            # A developer runs these against the model by hand. Counting them
+            # as automatable reported a permanent 0% coverage for a suite that
+            # was never going to be executed here.
+            automatable=False,
         )

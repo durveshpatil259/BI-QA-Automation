@@ -264,6 +264,7 @@ class PipelineRunner:
         ctx.report = self._s.report_service.build_report(
             ctx.project, token_usage=token_usage
         )
+        self._save_summary(ctx)
         total = ctx.usage.total_tokens
         suffix = f" · {total:,} tokens across {ctx.usage.total_calls} call(s)" if total else ""
         if ctx.budget_exhausted:
@@ -275,6 +276,71 @@ class PipelineRunner:
             _logger.info("  %-28s %6s tokens over %d call(s)",
                          entry.stage, f"{entry.total_tokens:,}", entry.calls)
         return f"Report {ctx.report.id}{suffix}"
+
+    def _save_summary(self, ctx: PipelineContext) -> None:
+        """Write the flat run record the dashboard aggregates over.
+
+        Best-effort: a summary that cannot be written must not fail a run that
+        otherwise succeeded, so this logs and moves on. The full artifacts are
+        still on disk and remain the source of truth.
+        """
+        from src.domain.models import RunSummary
+
+        try:
+            counts = ctx.metadata.summary_counts() if ctx.metadata else {}
+            results = ctx.results.summary() if ctx.results else {}
+            stats = getattr(ctx, "dedup_stats", None)
+            plan = ctx.validation_plan
+            # Severity comes from the same rule the Visual Bugs view applies,
+            # so the dashboard count and that page can never disagree.
+            from src.services.validation.issue_severity import classify
+
+            severity = {"High": 0, "Medium": 0, "Low": 0}
+            for row in (ctx.results.results if ctx.results else []):
+                if str(getattr(row, "status", "")).casefold().startswith("pass"):
+                    continue
+                _, level = classify(getattr(row, "match_type", ""),
+                                    getattr(row, "database_value", ""))
+                severity[level] = severity.get(level, 0) + 1
+            summary = RunSummary(
+                project_id=ctx.project.id,
+                project_name=ctx.project.name,
+                status="Completed",
+                processing_time_ms=ctx.project.processing_time_ms,
+                pages=int(counts.get("pages", 0) or 0),
+                visuals=int(counts.get("visuals", 0) or 0),
+                measures=int(counts.get("measures", 0) or 0),
+                tables=int(counts.get("tables", 0) or 0),
+                relationships=len(ctx.metadata.relationships or []) if ctx.metadata else 0,
+                tests_total=int(results.get("total", 0) or 0),
+                tests_passed=int(results.get("passed", 0) or 0),
+                tests_failed=int(results.get("failed", 0) or 0),
+                tests_warning=int(results.get("warnings", 0) or 0),
+                tests_skipped=int(results.get("skipped", 0) or 0),
+                test_cases=len(ctx.test_cases or []),
+                candidates=getattr(stats, "original", 0),
+                duplicates_removed=getattr(stats, "duplicates_removed", 0),
+                low_value_skipped=getattr(stats, "low_value_skipped", 0),
+                issues_high=severity["High"],
+                issues_medium=severity["Medium"],
+                issues_low=severity["Low"],
+                tokens=ctx.usage.total_tokens,
+                llm_calls=ctx.usage.total_calls,
+                compiled_without_llm=getattr(plan, "compiled_items", 0),
+            )
+            self._repo_of(ctx).save_run_summary(ctx.project, summary)
+            _logger.info("Run summary saved for %s: %d test(s), %d issue(s)",
+                         ctx.project.id, summary.tests_total, summary.issues)
+        except Exception as exc:  # noqa: BLE001 - never fail a completed run
+            _logger.warning("Could not write the run summary: %s", exc)
+
+    @staticmethod
+    def _repo_of(ctx: PipelineContext):
+        """The repository the services were built with."""
+        from src.storage.project_repository import ProjectRepository
+        from src.core.config import load_config
+
+        return ProjectRepository(load_config().projects_root_path)
 
     @staticmethod
     def _optimization(ctx: PipelineContext) -> dict:

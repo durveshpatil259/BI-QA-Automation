@@ -26,6 +26,8 @@ def _to_response(project: Project) -> ProjectResponse:
         name=project.name,
         description=project.description,
         bi_platform=str(project.bi_platform),
+        environment=project.environment,
+        processing_time_ms=project.processing_time_ms,
         status=str(project.status),
         dashboard_files=list(project.dashboard_files),
         created_at=project.created_at.isoformat(),
@@ -40,7 +42,8 @@ def _load(c: Container, project_id: str) -> Project:
 @router.post("", response_model=ProjectResponse, status_code=201)
 def create_project(body: CreateProjectRequest, c: Container = Depends(container)):
     project = c.project_service.create_project(
-        name=body.name, bi_platform=body.bi_platform, description=body.description
+        name=body.name, bi_platform=body.bi_platform, description=body.description,
+        environment=body.environment,
     )
     return _to_response(project)
 

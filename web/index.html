@@ -8,15 +8,46 @@
 </head>
 <body>
 
-<header class="topbar">
+
+<div class="app">
+
+<aside class="sidebar" id="sidebar">
   <div class="brand">
     <span class="logo">◆</span>
     <div>
       <h1>BI TestPilot AI</h1>
-      <p>Enterprise QA Automation for Business Intelligence</p>
+      <p>BI QA &amp; Unit Testing Automation</p>
     </div>
   </div>
-  <nav class="steps" aria-label="Progress">
+
+  <nav class="nav" aria-label="Sections">
+    <a class="nav-item" href="#/overview"><span class="ni">▤</span> Overview</a>
+    <a class="nav-item" href="#/projects"><span class="ni">▣</span> Projects</a>
+    <a class="nav-item is-cta" href="#/new"><span class="ni">＋</span> Create New Project</a>
+
+    <p class="nav-group">Results</p>
+    <a class="nav-item" href="#/suites"><span class="ni">▦</span> Test Suites</a>
+    <a class="nav-item" href="#/reports"><span class="ni">▥</span> Reports</a>
+    <a class="nav-item" href="#/sql"><span class="ni">▧</span> SQL Validations</a>
+    <a class="nav-item" href="#/unit"><span class="ni">▨</span> Unit Tests</a>
+    <a class="nav-item" href="#/bugs"><span class="ni">▩</span> Visual Bugs</a>
+
+    <p class="nav-group">Configuration</p>
+    <a class="nav-item" href="#/models"><span class="ni">◈</span> LLM Models</a>
+    <a class="nav-item" href="#/settings"><span class="ni">⚙</span> Settings</a>
+    <a class="nav-item" href="#/activity"><span class="ni">☰</span> Activity Log</a>
+    <a class="nav-item" href="#/help"><span class="ni">?</span> Help</a>
+  </nav>
+</aside>
+
+<div class="main-col">
+
+<header class="topbar">
+  <div class="page-title">
+    <h2 id="route-title">Dashboard Overview</h2>
+    <p id="route-sub">AI-powered Power BI QA and unit-test automation</p>
+  </div>
+  <nav class="steps" id="steps" aria-label="Progress" hidden>
     <span class="step is-active" data-step="1"><b>1</b> Setup</span>
     <span class="step" data-step="2"><b>2</b> Analysis</span>
     <span class="step" data-step="3"><b>3</b> Results</span>
@@ -24,6 +55,378 @@
 </header>
 
 <main>
+
+<!-- ══════════════════ ROUTE — OVERVIEW ══════════════════ -->
+<div class="route is-visible" id="route-overview">
+
+  <!-- Headline figures. Rendered from /api/dashboard/stats; every value is a
+       sum over completed runs, never a placeholder. -->
+  <div class="kpis" id="kpis">
+    <div class="kpi"><span class="kpi-l">Projects analysed</span><span class="kpi-n" id="k-projects">–</span></div>
+    <div class="kpi"><span class="kpi-l">Tests passed</span><span class="kpi-n pass" id="k-passed">–</span></div>
+    <div class="kpi"><span class="kpi-l">Issues found</span><span class="kpi-n fail" id="k-issues">–</span></div>
+    <div class="kpi"><span class="kpi-l">Test cases generated</span><span class="kpi-n" id="k-cases">–</span></div>
+    <div class="kpi"><span class="kpi-l">Avg processing time</span><span class="kpi-n" id="k-time">–</span></div>
+  </div>
+
+  <div class="ov-grid">
+    <div class="card start-card">
+      <h2>Start a new analysis</h2>
+      <p class="hint">
+        Upload a Power BI file, point it at the source of truth, and the
+        pipeline runs end to end — metadata, test selection, SQL validation
+        and report.
+      </p>
+      <a class="btn primary lg" href="#/new">Create New Project</a>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Test summary</h2></div>
+      <div id="summary-empty" class="empty" hidden>Nothing has been run yet.</div>
+      <div id="summary-body">
+        <div class="stack" id="stack"></div>
+        <ul class="legend" id="legend"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="ov-grid">
+    <div class="card" id="trend-card">
+      <div class="card-head"><h2>Tests over time</h2></div>
+      <div id="trend-body"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Issue severity</h2></div>
+      <div id="issues-body"></div>
+    </div>
+  </div>
+
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Recent projects</h2>
+      <a class="btn ghost sm" href="#/projects">View all</a>
+    </div>
+    <div id="recent-empty" class="empty" hidden>
+      No projects yet. <a href="#/analyze">Create your first project.</a>
+    </div>
+    <div class="table-wrap" id="recent-wrap">
+      <table id="recent">
+        <thead><tr>
+          <th>Project</th><th>Tests</th><th>Passed</th><th>Failed</th>
+          <th>Issues</th><th>Tokens</th><th>Time</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody id="recent-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card wide" id="opt-card" hidden>
+    <div class="card-head"><h2>Test selection across all runs</h2></div>
+    <p class="hint">
+      Tests are chosen, not enumerated. Candidates are generated
+      deterministically from each dashboard; what reaches a report is the
+      subset that proves something no other test already proves.
+    </p>
+    <div class="kpis compact" id="opt-kpis"></div>
+  </div>
+
+</div>
+
+<!-- ══════════════════ ROUTE — CREATE NEW PROJECT ══════════════════ -->
+<div class="route" id="route-new">
+  <div class="card form-card">
+    <h2>Create a new project</h2>
+    <p class="hint">
+      Project details are recorded with the results, so a report can be read
+      later without having to remember which dashboard and environment it came
+      from. Only the name is required.
+    </p>
+
+    <label>Project name
+      <input id="np-name" maxlength="100" placeholder="Sales Dashboard QA" autocomplete="off">
+    </label>
+
+    <label>Description <span class="opt">optional</span>
+      <input id="np-desc" maxlength="400" placeholder="What this analysis is checking, and why">
+    </label>
+
+    <div class="field-row">
+      <label>Platform
+        <select id="np-platform">
+          <option value="Power BI">Power BI</option>
+          <option value="Tableau">Tableau (parser not available)</option>
+        </select>
+      </label>
+      <label>Environment
+        <select id="np-env">
+          <option value="">Not specified</option>
+          <option value="Development">Development</option>
+          <option value="QA">QA</option>
+          <option value="UAT">UAT</option>
+          <option value="Production">Production</option>
+        </select>
+      </label>
+    </div>
+
+    <p class="status" id="np-status"></p>
+    <div class="form-actions">
+      <a class="btn ghost" href="#/overview">Cancel</a>
+      <button class="btn primary" id="np-create">Create and continue →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTE — PROJECTS ══════════════════ -->
+<div class="route" id="route-projects">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Projects <span class="count" id="pr-count"></span></h2>
+      <div class="filters">
+        <input id="pr-search" class="search" placeholder="Search by name…" autocomplete="off">
+        <select id="pr-status">
+          <option value="">Any status</option>
+          <option value="analysed">Analysed</option>
+          <option value="never">Never run</option>
+          <option value="failed">Has failures</option>
+          <option value="clean">All passed</option>
+        </select>
+        <select id="pr-env"><option value="">Any environment</option></select>
+      </div>
+    </div>
+    <div id="pr-empty" class="empty" hidden></div>
+    <div class="table-wrap" id="pr-wrap">
+      <table id="pr-table">
+        <thead><tr>
+          <th>Project</th><th>Environment</th><th>Updated</th>
+          <th>Tests</th><th>Passed</th><th>Failed</th><th>Time</th>
+          <th>Status</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="pr-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTE — REPORTS ══════════════════ -->
+<div class="route" id="route-reports">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Reports <span class="count" id="rp-count"></span></h2>
+      <div class="filters">
+        <input id="rp-search" class="search" placeholder="Search by project…" autocomplete="off">
+      </div>
+    </div>
+    <p class="hint">
+      Every project with a generated report. Downloads open the stored report
+      for that run — they do not re-analyse anything.
+    </p>
+    <div id="rp-empty" class="empty" hidden></div>
+    <div class="table-wrap" id="rp-wrap">
+      <table id="rp-table">
+        <thead><tr>
+          <th>Project</th><th>Generated</th><th>Tests</th><th>Passed</th>
+          <th>Failed</th><th>Issues</th><th>Download</th>
+        </tr></thead>
+        <tbody id="rp-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTES — RESULT VIEWS ══════════════════
+     Four readings of one project's stored results. The project picker is
+     shared: a test id is only unique within a run, so a table mixing projects
+     would invite comparisons that were never valid. -->
+<div class="route" id="route-suites">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Test suites</h2>
+      <div class="filters"><select id="tv-project-suites" class="proj-pick"></select></div>
+    </div>
+    <p class="hint">
+      Coverage is measured against tests automation can decide. A suite marked
+      <b>manual only</b> describes work for a person — hovering, clicking,
+      timing, exporting — which this tool never performs, so those are
+      deliverables rather than gaps.
+    </p>
+    <div class="tv-empty empty" hidden></div>
+    <div class="table-wrap">
+      <table><thead><tr>
+        <th>Suite</th><th>Total</th><th>Passed</th><th>Failed</th>
+        <th>Warning</th><th>Not executed</th><th>Manual</th><th>Coverage</th>
+      </tr></thead><tbody id="su-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="route" id="route-sql">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>SQL validations <span class="count" id="sq-count"></span></h2>
+      <div class="filters">
+        <select id="tv-project-sql" class="proj-pick"></select>
+        <input id="sq-search" class="search" placeholder="Search KPI…" autocomplete="off">
+        <select id="sq-status">
+          <option value="">Any status</option>
+          <option value="pass">Pass</option>
+          <option value="fail">Fail</option>
+        </select>
+      </div>
+    </div>
+    <div class="tv-empty empty" hidden></div>
+    <div class="table-wrap">
+      <table><thead><tr>
+        <th>Test ID</th><th>KPI</th><th>Scenario</th><th>How it was calculated</th>
+        <th>Dashboard</th><th>Database</th><th>Diff</th><th>ms</th><th>Status</th>
+      </tr></thead><tbody id="sq-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="route" id="route-unit">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Unit tests <span class="count" id="ut-count"></span></h2>
+      <div class="filters">
+        <select id="tv-project-unit" class="proj-pick"></select>
+        <input id="ut-search" class="search" placeholder="Search module…" autocomplete="off">
+      </div>
+    </div>
+    <p class="hint">
+      Model-level checks a developer runs against measures, calculated columns
+      and relationships, rather than against the rendered report.
+    </p>
+    <div class="tv-empty empty" hidden></div>
+    <div class="table-wrap">
+      <table><thead><tr>
+        <th>ID</th><th>Module</th><th>Scenario</th><th>Expected</th>
+        <th>Priority</th><th>Status</th>
+      </tr></thead><tbody id="ut-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="route" id="route-bugs">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Visual bugs <span class="count" id="vb-count"></span></h2>
+      <div class="filters">
+        <select id="tv-project-bugs" class="proj-pick"></select>
+        <select id="vb-sev">
+          <option value="">Any severity</option>
+          <option value="High">High</option>
+          <option value="Medium">Medium</option>
+          <option value="Low">Low</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint">
+      Every validation that did not pass, with what the difference most likely
+      means. Derived from the comparison itself — nothing here is inferred by AI.
+    </p>
+    <div class="tv-empty empty" hidden></div>
+    <div class="table-wrap">
+      <table><thead><tr>
+        <th>Test ID</th><th>KPI / Visual</th><th>Scenario</th><th>Issue</th>
+        <th>Dashboard</th><th>Database</th><th>Severity</th>
+      </tr></thead><tbody id="vb-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTES — CONFIGURATION ══════════════════ -->
+<div class="route" id="route-models">
+  <div class="card wide">
+    <div class="card-head"><h2>LLM models</h2></div>
+    <p class="hint">
+      Providers the backend can reach. Credentials are held server-side and are
+      never sent to the browser — a provider is shown only as configured or not.
+    </p>
+    <div class="table-wrap">
+      <table><thead><tr>
+        <th>Provider</th><th>Default model</th><th>Models</th>
+        <th>Credential</th><th>Daily token cap</th><th></th>
+      </tr></thead><tbody id="lm-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="route" id="route-settings">
+  <div id="st-body"></div>
+</div>
+
+<div class="route" id="route-activity">
+  <div class="card wide">
+    <div class="card-head">
+      <h2>Activity <span class="count" id="ac-count"></span></h2>
+    </div>
+    <p class="hint">
+      Derived from the projects themselves, so this can never claim something
+      the stored results do not show.
+    </p>
+    <div id="ac-empty" class="empty" hidden>No activity yet.</div>
+    <ul class="feed" id="ac-body"></ul>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTE — HELP ══════════════════ -->
+<div class="route" id="route-help">
+  <div class="card setting-group">
+    <h2>How a run works</h2>
+    <p class="hint">Nine stages, all automatic once you press Analyze.</p>
+    <ol class="steps-list">
+      <li><b>Extract metadata</b> — pages, visuals, measures, tables and relationships are read from the file. No AI.</li>
+      <li><b>Read the datasource schema</b> — tables and columns from SQL Server, or the sheets of a workbook.</li>
+      <li><b>Evaluate DAX</b> — measures are computed from the data inside the file, giving the value the dashboard would show.</li>
+      <li><b>Build the analysis context</b> — deterministic checks over the model itself.</li>
+      <li><b>Analyse with AI</b> — a short narrative summary. One call.</li>
+      <li><b>Generate SQL</b> — measures whose DAX Python can express are compiled directly; only the remainder is sent to the model.</li>
+      <li><b>Execute and compare</b> — queries run against the source and Python compares the numbers.</li>
+      <li><b>Select test cases</b> — candidates are generated, deduplicated by what they prove, and trimmed by priority.</li>
+      <li><b>Build the report</b> — HTML, PDF and Excel.</li>
+    </ol>
+  </div>
+
+  <div class="card setting-group">
+    <h2>What a result means</h2>
+    <div class="kv">
+      <div class="kv-row"><span class="k"><span class="pill pass">Pass</span> The source value matched the dashboard within tolerance</span><span></span></div>
+      <div class="kv-row"><span class="k"><span class="pill fail">Fail</span> The values differ, or the query could not run</span><span></span></div>
+      <div class="kv-row"><span class="k"><span class="pill warn">Warning</span> Executed, but something needs a look</span><span></span></div>
+      <div class="kv-row"><span class="k"><span class="pill">Not executed</span> A manual test case — nothing automated proves it</span><span></span></div>
+    </div>
+    <p class="hint">
+      Pass and fail are decided in Python by comparing numbers. The model is
+      never asked whether two values agree.
+    </p>
+  </div>
+
+  <div class="card setting-group">
+    <h2>Current limits</h2>
+    <ul class="plain">
+      <li>Power BI is fully supported. Tableau files are detected and declined — no parser is implemented.</li>
+      <li>Chart validation confirms that the categories exist in the source; it does not compare plotted values, which a file cannot supply without a screenshot.</li>
+      <li>A few advanced DAX functions cannot be compiled and fall back to generated SQL, which is less reliable.</li>
+      <li>Suites showing 0% coverage contain manual test cases, not failures.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ══════════════════ ROUTE — ANALYZE (existing flow, unchanged) ══════
+     The three <section class="screen"> elements below are the original
+     working flow. app.js toggles them by index through show(n), so they
+     must stay the only .screen elements and keep this order. -->
+<div class="route" id="route-analyze">
+
+<!-- Which project is being configured. The user must never have to guess. -->
+<div class="project-bar" id="project-bar" hidden>
+  <div>
+    <span class="pb-label">Project</span>
+    <b id="pb-name"></b>
+    <span class="pill" id="pb-env" hidden></span>
+  </div>
+  <a class="btn ghost sm" href="#/new">Change details</a>
+</div>
 
 <!-- ══════════════════ SCREEN 1 — SETUP ══════════════════ -->
 <section id="screen-1" class="screen is-visible">
@@ -184,7 +587,19 @@
   </div>
 </section>
 
+</div><!-- /route-analyze -->
+
+<div class="route" id="route-placeholder">
+  <div class="card">
+    <h2 id="ph-title">Not built yet</h2>
+    <p class="hint" id="ph-text"></p>
+    <a class="btn ghost" href="#/overview">← Back to overview</a>
+  </div>
+</div>
+
 </main>
+</div><!-- /main-col -->
+</div><!-- /app -->
 <script src="/static/app.js"></script>
 </body>
 </html>

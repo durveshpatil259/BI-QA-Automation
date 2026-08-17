@@ -17,6 +17,10 @@ class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: str = ""
     bi_platform: BIPlatform = BIPlatform.POWER_BI
+    #: Free text rather than an enum: which environments an organisation runs
+    #: is its own business, and rejecting "Pre-prod" would be the tool telling
+    #: the user their process is wrong. Recorded for context on a result.
+    environment: str = ""
 
 
 class ProjectResponse(BaseModel):
@@ -24,6 +28,8 @@ class ProjectResponse(BaseModel):
     name: str
     description: str = ""
     bi_platform: str
+    environment: str = ""
+    processing_time_ms: int | None = None
     status: str
     dashboard_files: list[str] = []
     created_at: str

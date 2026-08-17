@@ -28,11 +28,30 @@
       "provider_remaining": null
     },
     "Groq|llama-3.3-70b-versatile|c465ceb186c713e5": {
-      "date": "2026-08-14",
-      "tokens": 54236,
-      "calls": 16,
+      "date": "2026-08-17",
+      "tokens": 12536,
+      "calls": 3,
       "provider_remaining": null,
-      "updated_at": "2026-08-14T17:35:32"
+      "updated_at": "2026-08-17T13:27:00"
+    },
+    "Groq|openai/gpt-oss-120b|c465ceb186c713e5": {
+      "date": "2026-08-17",
+      "tokens": 58668,
+      "calls": 13,
+      "provider_remaining": null,
+      "updated_at": "2026-08-17T16:24:32"
+    },
+    "Grok|openai/gpt-oss-120b|9a52a422cb1eabce": {
+      "date": "2026-08-17",
+      "tokens": 0,
+      "calls": 0,
+      "provider_remaining": null
+    },
+    "Groq|grok-3|c465ceb186c713e5": {
+      "date": "2026-08-17",
+      "tokens": 0,
+      "calls": 0,
+      "provider_remaining": null
     }
   }
 }
