@@ -244,7 +244,8 @@ class PipelineRunner:
         return f"{s['total']} tests — {s['passed']} passed, {s['failed']} failed"
 
     def _generate_tests(self, ctx: PipelineContext) -> str:
-        ctx.test_cases = self._s.test_expansion_service.expand(ctx.project)
+        ctx.test_cases = self._s.test_expansion_service.expand(
+            ctx.project, ctx.dax_values)
         # Kept for the report's optimisation section: how many candidates were
         # generated and what was removed is the evidence that the suite is
         # deliberately compact rather than accidentally thin.

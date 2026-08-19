@@ -1177,11 +1177,15 @@ function renderUnit() {
     const s = (r.status || "").toLowerCase();
     const cls = s.startsWith("pass") ? "pass" : s.startsWith("fail") ? "fail"
       : s.startsWith("warn") ? "warn" : "";
+    // A verdict without its evidence is just an assertion. The remark says why
+    // the check decided as it did, and the actual value is what it read.
+    const finding = [r.actual, r.remarks].filter(Boolean).join(" — ");
     return "<tr>"
       + "<td>" + escapeHtml(r.test_case_id) + "</td>"
       + "<td>" + escapeHtml(r.module) + "</td>"
       + "<td>" + escapeHtml((r.scenario || "").slice(0, 90)) + "</td>"
       + "<td>" + escapeHtml((r.expected || "").slice(0, 80)) + "</td>"
+      + '<td class="muted">' + escapeHtml(finding.slice(0, 130)) + "</td>"
       + "<td>" + escapeHtml(r.priority) + "</td>"
       + '<td><span class="pill ' + cls + '">' + escapeHtml(r.status) + "</span></td>"
       + "</tr>";

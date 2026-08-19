@@ -35,11 +35,11 @@
       "updated_at": "2026-08-17T13:27:00"
     },
     "Groq|openai/gpt-oss-120b|c465ceb186c713e5": {
-      "date": "2026-08-17",
-      "tokens": 58668,
-      "calls": 13,
+      "date": "2026-08-18",
+      "tokens": 14653,
+      "calls": 4,
       "provider_remaining": null,
-      "updated_at": "2026-08-17T16:24:32"
+      "updated_at": "2026-08-18T11:34:09"
     },
     "Grok|openai/gpt-oss-120b|9a52a422cb1eabce": {
       "date": "2026-08-17",

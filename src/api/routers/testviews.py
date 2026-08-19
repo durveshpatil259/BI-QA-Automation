@@ -98,7 +98,10 @@ def project_tests(project_id: str, c: Container = Depends(container)):
             bucket["passed"] += 1
         elif status.startswith("fail"):
             bucket["failed"] += 1
-        elif status.startswith("warn"):
+        elif status.startswith("warn") or status.startswith("blocked"):
+            # Blocked means the check ran and could not reach a verdict — a
+            # different thing from nobody having run it, and the difference is
+            # what tells you whether the automation is working.
             bucket["warning"] += 1
         else:
             bucket["not_executed"] += 1

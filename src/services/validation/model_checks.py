@@ -26,7 +26,7 @@ from src.core.logger import get_logger
 _logger = get_logger()
 
 __all__ = ["CheckResult", "check_measure", "check_dax", "check_relationship",
-           "check_dataset"]
+           "check_dataset", "check_binding"]
 
 #: ``Table[Column]`` inside a DAX expression.
 _REF = re.compile(r"(?:'([^']+)'|(\w+))\s*\[\s*([^\]]+?)\s*\]")
@@ -79,7 +79,7 @@ def check_measure(measure, dax_values: dict) -> CheckResult:
         return CheckResult(
             TestStatus.FAIL, "The measure has no DAX expression.", "")
     return CheckResult(
-        TestStatus.WARNING,
+        TestStatus.BLOCKED,
         "Could not be evaluated from the file — the DAX is outside the "
         "evaluator's grammar, so correctness must be confirmed by hand.",
         "",
@@ -98,19 +98,31 @@ def check_dax(measure, metadata) -> CheckResult:
         return CheckResult(TestStatus.FAIL, "No DAX expression to check.", "")
 
     tables, measures = _names(metadata)
+    if not any(tables.values()):
+        # Some extractors return measures without ever listing columns. With no
+        # column inventory every reference looks missing, which would fail every
+        # measure in the model for a defect in the extractor, not the report.
+        return CheckResult(
+            TestStatus.BLOCKED,
+            "The model metadata lists no columns, so references cannot be "
+            "resolved against it.",
+            dax[:90],
+        )
     missing: list[str] = []
 
     for quoted, bare, column in _REF.findall(dax):
-        table = (quoted or bare or "").strip().casefold()
-        column = column.strip().casefold()
+        # Compare folded, but report the name exactly as the author wrote it —
+        # a developer searching their DAX for "sales[missing]" finds nothing.
+        raw_table, raw_column = (quoted or bare or "").strip(), column.strip()
+        table, column = raw_table.casefold(), raw_column.casefold()
         if not table:
             continue
         if table not in tables:
-            missing.append(f"table '{quoted or bare}'")
+            missing.append(f"table '{raw_table}'")
         elif column not in tables[table]:
             # A measure may be written Table[Measure]; that is still resolvable.
             if column not in measures:
-                missing.append(f"{quoted or bare}[{column}]")
+                missing.append(f"{raw_table}[{raw_column}]")
 
     # Bare [Measure] references must name a measure that exists.
     for ref in _MEASURE_REF.findall(re.sub(r"(?:'[^']+'|\w+)\s*\[[^\]]+\]", " ", dax)):
@@ -152,14 +164,98 @@ def check_relationship(relationship, metadata) -> CheckResult:
         return CheckResult(TestStatus.FAIL, "; ".join(problems), detail)
     if not relationship.is_active:
         return CheckResult(
-            TestStatus.WARNING,
-            "Both endpoints exist but the relationship is inactive, so it "
-            "propagates no filter unless USERELATIONSHIP invokes it.",
+            TestStatus.PASS,
+            "Both endpoints exist. The relationship is inactive, so it "
+            "propagates no filter unless USERELATIONSHIP invokes it — normal "
+            "for a role-playing dimension, worth a look if it was not intended.",
             detail,
         )
     return CheckResult(
         TestStatus.PASS,
         f"Both endpoints exist; active, {relationship.cardinality or 'cardinality unstated'}.",
+        detail,
+    )
+
+
+#: An aggregation wrapper around a field, e.g. ``Sum(Sales.Amount)``.
+_AGG = re.compile(r"^\s*\w+\s*\(\s*(.+?)\s*\)\s*$")
+
+
+def _binding_parts(field: str) -> tuple[str, str]:
+    """Split a report's field reference into (table, column).
+
+    Report layouts do not write DAX. A binding arrives as ``Sales.Total Profit``,
+    wrapped in its aggregate as ``Sum(Sales.Sales Amount)``, or extended down a
+    date hierarchy as ``Date.Date.Variation.Date Hierarchy.Year``. Reading any
+    of those literally finds no such column and reports a healthy visual as
+    broken, which is exactly what happened before this existed.
+    """
+    text = field.strip()
+    while (agg := _AGG.match(text)):
+        text = agg.group(1).strip()
+
+    match = _REF.fullmatch(text)
+    if match:
+        quoted, bare, column = match.groups()
+        return (quoted or bare or "").strip(), column.strip()
+
+    if "." in text:
+        # The first two segments are table and column; anything after them is
+        # hierarchy navigation, which resolves through the column itself.
+        table, _, rest = text.partition(".")
+        return table.strip(), rest.partition(".")[0].strip()
+    return "", text
+
+
+def check_binding(fields, metadata) -> CheckResult:
+    """Does every field the visual binds to still exist in the model?
+
+    This is the check that catches a renamed or deleted column after someone
+    edits the model: the visual keeps its binding, and the report breaks. It is
+    answerable by name lookup, which is why it belongs here and not on a
+    reviewer's checklist.
+    """
+    wanted = [str(f).strip() for f in (fields or []) if str(f).strip()]
+    if not wanted:
+        return CheckResult(
+            TestStatus.NOT_EXECUTED,
+            "The extraction recorded no field bindings for this visual, so "
+            "there is nothing to resolve.",
+            "",
+        )
+
+    tables, measures = _names(metadata)
+    every_column = {c for cols in tables.values() for c in cols}
+    if not every_column and not measures:
+        return CheckResult(
+            TestStatus.BLOCKED,
+            "The model metadata lists no columns or measures, so bindings "
+            "cannot be resolved against it.",
+            ", ".join(wanted[:5]),
+        )
+    unresolved = []
+    for field in wanted:
+        table, name = _binding_parts(field)
+        table, name = table.casefold(), name.casefold()
+        if table in tables and (name in tables[table] or name in measures):
+            continue
+        # Unqualified, or qualified by a table the extractor named differently:
+        # the name still counts as resolved if the model has it somewhere.
+        if name in every_column or name in measures:
+            continue
+        unresolved.append(field)
+
+    detail = ", ".join(wanted[:5])
+    if unresolved:
+        return CheckResult(
+            TestStatus.FAIL,
+            "Bound to field(s) that do not exist in the model: "
+            + ", ".join(unresolved[:4]),
+            detail,
+        )
+    return CheckResult(
+        TestStatus.PASS,
+        f"All {len(wanted)} bound field(s) resolve against the model.",
         detail,
     )
 
@@ -173,7 +269,7 @@ def check_dataset(table, db_schema) -> CheckResult:
 
     if db_schema is None:
         return CheckResult(
-            TestStatus.WARNING,
+            TestStatus.BLOCKED,
             f"{len(columns)} column(s) in the model. No datasource schema was "
             "read, so the source side could not be checked.",
             f"{len(columns)} columns",
@@ -185,9 +281,16 @@ def check_dataset(table, db_schema) -> CheckResult:
                      for t in (db_schema.tables or [])}
     match, score = (map_table_to_dataset([c.name for c in columns], source_tables)
                     if source_tables else ("", 0.0))
+    if getattr(table, "is_calculated", False):
+        return CheckResult(
+            TestStatus.PASS,
+            f"{len(columns)} column(s); calculated table, so it is defined by "
+            "DAX and has no source table to match.",
+            f"{len(columns)} columns (calculated)",
+        )
     if not match:
         return CheckResult(
-            TestStatus.WARNING,
+            TestStatus.BLOCKED,
             f"{len(columns)} column(s) in the model, but no source table shares "
             "enough of them to be identified as its origin.",
             f"{len(columns)} columns",

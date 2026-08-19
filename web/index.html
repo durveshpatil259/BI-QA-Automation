@@ -293,14 +293,16 @@
       </div>
     </div>
     <p class="hint">
-      Model-level checks a developer runs against measures, calculated columns
-      and relationships, rather than against the rendered report.
+      Model-level checks against measures, calculated columns and relationships,
+      rather than against the rendered report. These are decided here — each
+      measure is evaluated, and every DAX and visual field reference is resolved
+      against the model — so the finding column shows what the check actually read.
     </p>
     <div class="tv-empty empty" hidden></div>
     <div class="table-wrap">
       <table><thead><tr>
         <th>ID</th><th>Module</th><th>Scenario</th><th>Expected</th>
-        <th>Priority</th><th>Status</th>
+        <th>Finding</th><th>Priority</th><th>Status</th>
       </tr></thead><tbody id="ut-body"></tbody></table>
     </div>
   </div>

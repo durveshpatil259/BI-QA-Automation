@@ -171,22 +171,20 @@ _PAGE_QA = [
      "Export page", "Exported page matches the on-screen layout.", Priority.LOW),
 ]
 
+# Measure and DAX tests are deliberately absent here. Every measure in the
+# model — including the ones behind these KPIs — is checked for real in
+# ``_model_dev_cases``; restating them per-KPI only added rows that nothing
+# could ever execute.
 _KPI_DEV = [
-    ("Measure Test", "Unit-test the measure behind KPI '{n}'",
-     "1. Evaluate the measure in isolation for known inputs.",
-     "Known dataset", "Measure returns the expected value.", Priority.HIGH),
-    ("DAX Test", "Validate DAX logic for KPI '{n}'",
-     "1. Review the DAX (filters, context transition, division-by-zero).",
-     "DAX review", "DAX is correct and safe for edge cases.", Priority.HIGH),
     ("Visual Binding Test", "Verify KPI '{n}' field binding",
-     "1. Confirm the KPI card binds to the intended measure.",
-     "Binding", "KPI is bound to the correct measure.", Priority.MEDIUM),
+     "1. Resolve the field the KPI card binds to against the model.",
+     "Binding", "The bound field exists in the model.", Priority.MEDIUM),
 ]
 
 _CHART_DEV = [
     ("Visual Binding Test", "Verify chart '{n}' field bindings",
-     "1. Confirm axis/legend/values bind to intended columns/measures.",
-     "Binding", "Chart bindings are correct.", Priority.MEDIUM),
+     "1. Resolve every axis/legend/value binding against the model.",
+     "Binding", "Every bound field exists in the model.", Priority.MEDIUM),
     ("Formatting Test", "Verify chart '{n}' conditional formatting rules",
      "1. Review conditional formatting/data colours of chart '{n}'.",
      "Formatting rules", "Formatting rules behave as intended.", Priority.LOW),
@@ -233,7 +231,11 @@ class TestExpansionService:
             getattr(visual, "visual_type", "")) in VisualKind.DATA_KINDS
 
     def _charts(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
-        """[(display name, [lookup aliases])] for every data-bearing visual."""
+        """[(display name, [lookup aliases], [bound fields])] per data visual.
+
+        The bound fields ride along so the binding test can be decided rather
+        than described — they are the whole content of that check.
+        """
         source = (ext.visuals if ext and ext.visuals
                   else (md.all_visuals if md else []))
         out = []
@@ -243,7 +245,11 @@ class TestExpansionService:
             aliases = self._chart_aliases(v)
             display = (getattr(v, "title", "") or (aliases[-1] if aliases else "")
                        or getattr(v, "id", "") or "visual")
-            out.append((display, aliases))
+            fields = [f for f in (
+                list(getattr(v, "fields", []) or [])
+                + [getattr(v, "dimension_field", ""), getattr(v, "measure_field", "")]
+            ) if f]
+            out.append((display, aliases, list(dict.fromkeys(fields))))
         return out
 
     def _filters(self, ext: DashboardExtraction | None, md: DashboardMetadata | None):
@@ -278,21 +284,26 @@ class TestExpansionService:
         # 1) SQL validation tests (executed) — carry Generated SQL + PASS/FAIL.
         cases.extend(self._sql_validation_cases(run))
 
-        # 2) KPI tests (QA + Dev)
+        from src.services.validation import model_checks as checks
+
+        # 2) KPI tests (QA + Dev). A KPI card binds to one field — its own
+        # measure — so its binding test is the same resolution check.
         for name, value in self._kpis(ext, md):
             ev = evidence.get(name.casefold())
             cases.extend(self._from_templates(
                 _KPI_QA, TestCaseKind.QA, f"KPI: {name}", name, value, ev))
             cases.extend(self._from_templates(
-                _KPI_DEV, TestCaseKind.UNIT, f"KPI: {name}", name, value, ev))
+                _KPI_DEV, TestCaseKind.UNIT, f"KPI: {name}", name, value, ev,
+                checks={"Visual Binding Test": checks.check_binding([name], md)}))
 
         # 3) Chart tests (QA + Dev)
-        for name, aliases in self._charts(ext, md):
+        for name, aliases, fields in self._charts(ext, md):
             ev = next((evidence[a] for a in aliases if a in evidence), None)
             cases.extend(self._from_templates(
                 _CHART_QA, TestCaseKind.QA, f"Chart: {name}", name, "", ev))
             cases.extend(self._from_templates(
-                _CHART_DEV, TestCaseKind.UNIT, f"Chart: {name}", name, "", ev))
+                _CHART_DEV, TestCaseKind.UNIT, f"Chart: {name}", name, "", ev,
+                checks={"Visual Binding Test": checks.check_binding(fields, md)}))
 
         # 4) Filter tests (QA)
         for name in self._filters(ext, md):
@@ -379,25 +390,38 @@ class TestExpansionService:
 
     @staticmethod
     def _from_templates(
-        templates, kind, module, name, value, evidence: _Evidence | None = None
+        templates, kind, module, name, value, evidence: _Evidence | None = None,
+        checks: dict | None = None,
     ) -> list[TestCase]:
+        """Expand templates, preferring a directly computed check over evidence.
+
+        ``checks`` maps a template type to a already-decided ``CheckResult``.
+        It wins over inherited SQL evidence because it tested this very
+        assertion, whereas evidence is inherited from an adjacent one.
+        """
         out = []
         for ttype, scenario, steps, tdata, expected, priority in templates:
+            computed = (checks or {}).get(ttype)
             resolved = evidence.resolve(ttype) if evidence else None
-            status, remarks = (
-                resolved if resolved
-                else (TestStatus.NOT_EXECUTED,
-                      "Auto-generated; execute manually or via automation.")
-            )
+            if computed is not None:
+                status, remarks = computed.status, computed.remark
+                actual, automatable = computed.actual, True
+            elif resolved:
+                status, remarks = resolved
+                actual, automatable = "", ttype in _Evidence.AUTOMATABLE
+            else:
+                status = TestStatus.NOT_EXECUTED
+                remarks = "Auto-generated; execute manually or via automation."
+                actual, automatable = "", ttype in _Evidence.AUTOMATABLE
             out.append(TestCase(
-                automatable=ttype in _Evidence.AUTOMATABLE,
+                automatable=automatable,
                 kind=kind, module=module,
                 test_scenario=f"[{ttype}] " + scenario.format(n=name, v=value or "—"),
                 test_steps=steps.format(n=name, v=value or "—"),
                 test_data=tdata.format(n=name, v=value or "—"),
                 expected_result=expected.format(n=name, v=value or "—"),
                 status=status, priority=priority,
-                remarks=remarks,
+                remarks=remarks, actual_result=actual,
                 dashboard_value=value or "",
             ))
         return out
@@ -505,15 +529,27 @@ class TestExpansionService:
         return out
 
     @staticmethod
-    def _dev(module, ttype, scenario, steps, tdata, expected, priority) -> TestCase:
+    def _dev(module, ttype, scenario, steps, tdata, expected, priority,
+             result=None) -> TestCase:
+        """One developer test. With ``result`` it is executed; without it, manual.
+
+        The distinction is what the suite's coverage number means: a test is
+        only counted as automatable when something here actually decided it.
+        """
+        if result is None:
+            return TestCase(
+                kind=TestCaseKind.UNIT, module=module,
+                test_scenario=f"[{ttype}] {scenario}", test_steps=steps,
+                test_data=tdata, expected_result=expected,
+                status=TestStatus.NOT_EXECUTED, priority=priority,
+                remarks="Auto-generated developer test; run manually.",
+                automatable=False,
+            )
         return TestCase(
             kind=TestCaseKind.UNIT, module=module,
             test_scenario=f"[{ttype}] {scenario}", test_steps=steps,
             test_data=tdata, expected_result=expected,
-            status=TestStatus.NOT_EXECUTED, priority=priority,
-            remarks="Auto-generated developer test.",
-            # A developer runs these against the model by hand. Counting them
-            # as automatable reported a permanent 0% coverage for a suite that
-            # was never going to be executed here.
-            automatable=False,
+            actual_result=result.actual, status=result.status,
+            priority=priority, remarks=result.remark,
+            automatable=True,
         )
